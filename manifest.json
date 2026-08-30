@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.boomdev.voxtype-meeting-transcriber",
+  "name": "Voxtype Meeting Transcriber",
+  "version": "0.2.0",
+  "author": "boomdev",
+  "license": "MIT",
+  "description": "An Omarchy meeting transcriber with ordered local transcription through Voxtype.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Voxtype Meeting Transcriber",
+    "description": "Record, pause, review, and export ordered meeting transcripts from the Omarchy bar.",
+    "category": "Audio",
+    "aliases": ["voxtype", "meeting", "transcription"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "notificationsEnabled": false,
+      "exportDirectory": "~/Documents/Meetings",
+      "refreshIntervalSec": 15,
+      "meetingLanguage": "en",
+      "enabledLanguages": ["auto", "en"]
+    },
+    "schema": [
+      {
+        "key": "notificationsEnabled",
+        "type": "boolean",
+        "label": "Desktop notifications",
+        "defaultValue": false
+      },
+      {
+        "key": "exportDirectory",
+        "type": "path",
+        "label": "Transcript export folder",
+        "defaultValue": "~/Documents/Meetings"
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Idle refresh interval (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "meetingLanguage",
+        "type": "string",
+        "label": "Meeting language",
+        "defaultValue": "en"
+      }
+    ]
+  }
+}

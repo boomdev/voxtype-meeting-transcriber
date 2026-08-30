@@ -1,0 +1,12 @@
+[Unit]
+Description=Voxtype Meeting Transcriber capture and transcription service
+After=pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/voxtype-meeting-service run
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

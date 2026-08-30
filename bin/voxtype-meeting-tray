@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""JSON bridge from the Omarchy popup to voxtype-meeting-service."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import tomllib
+
+APP = "Voxtype Meeting Transcriber"
+EXPORT_SIDECAR = "export.json"
+
+# Matches Voxtype's Engine → Whisper · language TUI cycle list (src/tui/engine.rs LANG_CHOICES).
+VOXTYPE_WHISPER_LANGUAGES = [
+    "auto", "en", "fr", "de", "it", "es", "pt", "nl", "pl", "zh", "ja", "ko", "ru", "ar",
+]
+WHISPER_LANGUAGES = [
+    "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs", "ca", "cs", "cy",
+    "da", "de", "el", "en", "es", "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw",
+    "he", "hi", "hr", "ht", "hu", "hy", "id", "is", "it", "ja", "jw", "ka", "kk", "km", "kn",
+    "ko", "la", "lb", "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+    "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru", "sa", "sd", "si",
+    "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl",
+    "tr", "tt", "uk", "ur", "uz", "vi", "yi", "yo", "yue", "zh",
+]
+SENSEVOICE_LANGUAGES = ["auto", "zh", "en", "ja", "ko", "yue"]
+COHERE_LANGUAGES = ["ar", "de", "en", "es", "fr", "hi", "it", "ja", "ko", "nl", "pt", "ru", "tr", "zh"]
+PARAFORMER_LANGUAGES = ["zh", "en"]
+DOLPHIN_LANGUAGES = [
+    "auto", "ar", "de", "en", "es", "fr", "hi", "id", "it", "ja", "ko", "nl", "pl", "pt", "ru",
+    "th", "tr", "uk", "vi", "zh", "yue",
+]
+
+
+def emit(value: dict, code: int = 0) -> int:
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    return code
+
+def runtime_socket() -> Path:
+    root = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(root) / "voxtype-meeting-service" / "voxtype-meeting-service.sock"
+
+def request(payload: dict) -> dict:
+    path = runtime_socket()
+    if not path.exists():
+        return {"ok": False, "error": "Voxtype Meeting Service is not running."}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(35)
+            client.connect(str(path))
+            client.sendall(json.dumps(payload).encode() + b"\n")
+            data = b""
+            while b"\n" not in data:
+                block = client.recv(65536)
+                if not block: break
+                data += block
+        return json.loads(data.splitlines()[0])
+    except (OSError, ValueError, IndexError) as exc:
+        return {"ok": False, "error": f"Could not contact the meeting service: {exc}"}
+
+def voxtype_config_path() -> Path:
+    return Path.home() / ".config/voxtype/config.toml"
+
+def normalize_language_code(value) -> str:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else "en"
+    code = str(value or "en").strip().lower()
+    if "," in code:
+        code = code.split(",", 1)[0].strip()
+    return code or "en"
+
+def voxtype_summary() -> tuple[str, str, str]:
+    try:
+        with voxtype_config_path().open("rb") as handle:
+            cfg = tomllib.load(handle)
+        engine = str(cfg.get("engine") or "whisper")
+        section = cfg.get(engine) if isinstance(cfg.get(engine), dict) else cfg.get("whisper", {})
+        section = section or {}
+        model = str(section.get("model") or "configured")
+        return engine, model, normalize_language_code(section.get("language", "en"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return "voxtype", "configured", "en"
+
+def language_option(code: str) -> dict:
+    value = str(code or "").strip().lower()
+    return {"value": value, "label": value.upper()}
+
+def moonshine_languages(model: str) -> list[str]:
+    name = Path(model or "").name.lower()
+    codes = []
+    if any(token in name for token in ("ja", "japanese")):
+        codes.append("ja")
+    if any(token in name for token in ("zh", "cmn", "chinese", "mandarin")):
+        codes.append("zh")
+    if any(token in name for token in ("ko", "korean")):
+        codes.append("ko")
+    if any(token in name for token in ("ar", "arabic")):
+        codes.append("ar")
+    return codes or ["en"]
+
+def language_codes_for(engine: str, model: str) -> list[str]:
+    kind = (engine or "whisper").lower()
+    if kind in ("whisper", "voxtype"):
+        return list(VOXTYPE_WHISPER_LANGUAGES)
+    if kind == "sensevoice":
+        return list(SENSEVOICE_LANGUAGES)
+    if kind == "cohere":
+        return list(COHERE_LANGUAGES)
+    if kind == "paraformer":
+        return list(PARAFORMER_LANGUAGES)
+    if kind == "moonshine":
+        return moonshine_languages(model)
+    if kind == "parakeet":
+        return ["en"]
+    if kind == "dolphin":
+        return list(DOLPHIN_LANGUAGES)
+    if kind == "omnilingual":
+        return ["auto", *WHISPER_LANGUAGES]
+    return ["auto", "en"]
+
+def available_languages(engine: str, model: str) -> list[dict]:
+    seen = set()
+    options = []
+    for code in language_codes_for(engine, model):
+        option = language_option(code)
+        if not option["value"] or option["value"] in seen:
+            continue
+        seen.add(option["value"])
+        options.append(option)
+    return options
+
+def apply_language_override(contents: str, engine: str, language: str) -> str:
+    header = f"[{engine}]"
+    quoted_header = f"[\"{engine}\"]"
+    replacement = f'language = "{language}"'
+    lines = contents.splitlines()
+    in_section = False
+    replaced = False
+    insert_at = None
+    for index, line in enumerate(lines):
+        trimmed = line.strip()
+        if trimmed.startswith("[") and trimmed.endswith("]"):
+            if in_section and not replaced:
+                insert_at = index
+                break
+            in_section = trimmed.lower() in (header.lower(), quoted_header.lower())
+            if in_section:
+                insert_at = index + 1
+            continue
+        lower = trimmed.lower()
+        if in_section and lower.startswith("language") and lower[8:].lstrip().startswith("="):
+            indent = line[: len(line) - len(line.lstrip())]
+            lines[index] = f"{indent}{replacement}"
+            replaced = True
+            break
+    if not replaced:
+        if insert_at is not None:
+            lines.insert(insert_at, replacement)
+        else:
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.append(header)
+            lines.append(replacement)
+    out = "\n".join(lines)
+    if contents.endswith("\n"):
+        out += "\n"
+    return out
+
+def set_voxtype_language(code: str) -> dict:
+    language = normalize_language_code(code)
+    path = voxtype_config_path()
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"ok": False, "error": "Voxtype configuration was not found."}
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not read Voxtype configuration: {exc}"}
+    engine, model, _current = voxtype_summary()
+    name = Path(model or "").name.lower()
+    if (name.endswith(".en") or ".en." in name) and language != "en":
+        return {"ok": False, "error": "This Voxtype model is English-only."}
+    allowed = {item["value"] for item in available_languages(engine, model)}
+    if language not in allowed:
+        return {"ok": False, "error": f"Language '{language}' is not available for the current Voxtype engine."}
+    updated = apply_language_override(contents, engine, language)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(updated, encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not update Voxtype language: {exc}"}
+    return {"ok": True, "message": "Voxtype language updated", "language": language, "engine": engine, "model": model}
+
+def export_sidecar_path(session_dir: str | Path) -> Path:
+    return Path(session_dir) / EXPORT_SIDECAR
+
+def read_exported_path(session_dir: str) -> str:
+    if not session_dir:
+        return ""
+    sidecar = export_sidecar_path(session_dir)
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    path = str(payload.get("path") or "").strip()
+    return path if path and Path(path).is_file() else ""
+
+def write_exported_path(session_dir: str, path: Path) -> None:
+    if not session_dir:
+        return
+    sidecar = export_sidecar_path(session_dir)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(json.dumps({"path": str(path)}, ensure_ascii=False), encoding="utf-8")
+
+def normalize_session(item: dict) -> dict:
+    session_dir = str(item.get("session_dir") or "")
+    return {
+        "id": str(item.get("id") or ""), "title": str(item.get("title") or "Meeting"),
+        "startedAt": str(item.get("started_at") or ""), "endedAt": str(item.get("ended_at") or ""),
+        "durationSecs": int(item.get("duration_secs") or 0), "status": str(item.get("ui_status") or item.get("state") or "unknown"),
+        "chunkCount": int(item.get("chunk_count") or 0), "storagePath": session_dir,
+        "transcriptPath": str(item.get("transcript_md") or ""), "transcriptExists": item.get("transcript_exists") is True,
+        "exportedPath": read_exported_path(session_dir),
+    }
+
+def device_options(items: list[dict], configured: str) -> list[dict]:
+    options = [{"value": "default", "label": "System default"}]
+    seen = {"default"}
+    for item in items:
+        device_id = str(item.get("id") or "").strip()
+        if not device_id or device_id in seen:
+            continue
+        label = str(item.get("description") or device_id).strip()
+        options.append({"value": device_id, "label": label})
+        seen.add(device_id)
+    if configured and configured not in seen:
+        options.append({"value": configured, "label": configured})
+    return options
+
+def snapshot() -> dict:
+    state = request({"op": "get_state"})
+    if not state.get("ok"):
+        engine, model, language = voxtype_summary()
+        return {"ok": True, "installed": shutil.which("voxtype-meeting-service") is not None,
+                "available": False, "state": "idle", "active": None, "recent": [],
+                "options": {"engine": engine, "model": model, "language": language,
+                            "availableLanguages": available_languages(engine, model)},
+                "configPath": str(Path.home()/".config/voxtype-meeting-service/config.toml"),
+                "error": state.get("error", "Meeting service unavailable")}
+    recording = state.get("recording") or {}
+    active = None
+    if recording.get("active") and recording.get("session_id"):
+        detail = request({"op": "get_session", "session_id": recording["session_id"]})
+        active = normalize_session(detail.get("session") or {"id": recording["session_id"], "started_at": recording.get("started_at")})
+    config = request({"op": "get_config"})
+    audio = ((config.get("config") or {}).get("audio") or {}) if config.get("ok") else {}
+    devices = request({"op": "list_devices"})
+    mic_device = str(audio.get("microphone", "default"))
+    output_device = str(audio.get("system_output", "default"))
+    engine, model, language = voxtype_summary()
+    paused = recording.get("paused") is True
+    current_state = "paused" if paused else "recording" if recording.get("active") else "idle"
+    return {"ok": True, "installed": True, "available": True, "state": current_state,
+            "active": active, "recent": [normalize_session(x) for x in state.get("recent_sessions", [])],
+            "options": {"source": audio.get("source", "both"), "retainAudio": audio.get("retain_audio", False),
+                        "micDevice": mic_device, "loopbackDevice": output_device,
+                        "micDevices": device_options(devices.get("microphones", []), mic_device),
+                        "outputDevices": device_options(devices.get("outputs", []), output_device),
+                        "engine": engine, "model": model, "language": language,
+                        "availableLanguages": available_languages(engine, model)},
+            "configPath": str(Path.home()/".config/voxtype-meeting-service/config.toml"), "restartRequired": False, "error": ""}
+
+def action(name: str, title: str, language: str = "") -> dict:
+    op = {"start": "start_recording", "stop": "stop_recording", "pause": "pause_recording", "resume": "resume_recording"}[name]
+    payload = {"op": op}
+    if name == "start" and language.strip():
+        payload["language"] = language.strip()
+    result = request(payload)
+    if not result.get("ok"): return result
+    if name == "start" and title.strip() and result.get("session_id"):
+        renamed = request({"op": "rename_session", "session_id": result["session_id"], "title": title.strip()})
+        if not renamed.get("ok"): return renamed
+    labels = {"start": "Meeting started", "stop": "Meeting stopped", "pause": "Meeting paused", "resume": "Meeting resumed"}
+    return {**result, "ok": True, "message": labels[name]}
+
+def home_path(value: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(value)))
+
+def safe_name(title: str, started: str) -> str:
+    try: stamp = dt.datetime.fromisoformat(started.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d_%H-%M")
+    except ValueError: stamp = "meeting"
+    cleaned = "-".join("".join(c for c in title.lower() if c.isalnum() or c in " -_").split()) or "meeting"
+    return f"{stamp}_{cleaned[:80]}.md"
+
+def find_session(meeting_id: str) -> dict:
+    sessions = request({"op": "list_sessions"})
+    if not sessions.get("ok"): return sessions
+    items = sessions.get("sessions") or []
+    selected = items[0] if meeting_id == "latest" and items else next((x for x in items if x.get("id") == meeting_id), None)
+    if not selected:
+        return {"ok": False, "error": "No matching meeting was found."}
+    return {"ok": True, "session": selected}
+
+def open_path(path: Path) -> dict | None:
+    if not path.is_file():
+        return {"ok": False, "error": "The exported transcript is no longer on disk.", "path": str(path)}
+    opener = shutil.which("omarchy-launch-editor") or shutil.which("xdg-open")
+    if not opener:
+        return {"ok": False, "error": "Could not open the transcript because no editor launcher is available.", "path": str(path)}
+    try:
+        subprocess.Popen(
+            [opener, str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not open the transcript: {exc}", "path": str(path)}
+    return None
+
+def export_meeting(meeting_id: str, directory: str, open_after: bool) -> dict:
+    found = find_session(meeting_id)
+    if not found.get("ok"): return found
+    selected = found["session"]
+    source = Path(str(selected.get("transcript_md") or ""))
+    if not source.is_file(): return {"ok": False, "error": "The transcript is still being prepared."}
+    target_dir = home_path(directory); target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / safe_name(str(selected.get("title") or "Meeting"), str(selected.get("started_at") or ""))
+    suffix = 2
+    while target.exists(): target = target.with_name(f"{target.stem}-{suffix}{target.suffix}"); suffix += 1
+    shutil.copy2(source, target)
+    write_exported_path(str(selected.get("session_dir") or ""), target)
+    if open_after:
+        failed = open_path(target)
+        if failed: return {**failed, "message": "Transcript exported"}
+    return {"ok": True, "message": "Transcript exported", "path": str(target), "meetingId": selected.get("id")}
+
+def open_meeting(meeting_id: str) -> dict:
+    found = find_session(meeting_id)
+    if not found.get("ok"): return found
+    selected = found["session"]
+    exported = read_exported_path(str(selected.get("session_dir") or ""))
+    if not exported:
+        return {"ok": False, "error": "This transcript has not been exported yet."}
+    failed = open_path(Path(exported))
+    if failed: return failed
+    return {"ok": True, "message": "Transcript opened", "path": exported, "meetingId": selected.get("id")}
+
+def open_directory(path: Path) -> dict | None:
+    command = folder_opener_command(path)
+    if not command:
+        return {"ok": False, "error": "Could not open the folder because no file manager is available.", "path": str(path)}
+    try:
+        subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not open the folder: {exc}", "path": str(path)}
+    return None
+
+def folder_opener_command(path: Path) -> list[str] | None:
+    uwsm = shutil.which("uwsm-app")
+    nautilus = shutil.which("nautilus")
+    if uwsm and nautilus:
+        return [uwsm, "--", nautilus, "--new-window", str(path)]
+    if nautilus:
+        return [nautilus, "--new-window", str(path)]
+    xdg = shutil.which("xdg-open")
+    if xdg:
+        return [xdg, str(path)]
+    return None
+
+def open_export_folder(directory: str) -> dict:
+    target = home_path(directory)
+    target.mkdir(parents=True, exist_ok=True)
+    failed = open_directory(target)
+    if failed:
+        return failed
+    return {"ok": True, "message": "Transcripts folder opened", "path": str(target)}
+
+def save_options(raw: str) -> dict:
+    try: values = json.loads(raw)
+    except ValueError as exc: return {"ok": False, "error": f"Invalid meeting settings: {exc}"}
+    audio = {"source": values.get("source", "both"), "retain_audio": values.get("retainAudio", False),
+             "microphone": values.get("micDevice", "default"), "system_output": values.get("loopbackDevice", "default")}
+    result = request({"op": "update_config", "config": {"audio": audio}})
+    return {**result, "message": "Meeting options saved", "restartRequired": False} if result.get("ok") else result
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(); sub = root.add_subparsers(dest="command", required=True)
+    sub.add_parser("snapshot")
+    act = sub.add_parser("action")
+    act.add_argument("name", choices=["start","stop","pause","resume"])
+    act.add_argument("--title", default="")
+    act.add_argument("--language", default="")
+    exp = sub.add_parser("export")
+    exp.add_argument("meeting_id")
+    exp.add_argument("--directory", required=True)
+    exp.add_argument("--open", action="store_true", dest="open_after")
+    opened = sub.add_parser("open")
+    opened.add_argument("meeting_id")
+    folder = sub.add_parser("open-folder")
+    folder.add_argument("--directory", required=True)
+    settings = sub.add_parser("settings"); settings.add_argument("json")
+    lang = sub.add_parser("language"); lang.add_argument("code")
+    sub.add_parser("restart"); return root
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.command == "snapshot": result = snapshot()
+        elif args.command == "action": result = action(args.name, args.title, args.language)
+        elif args.command == "export": result = export_meeting(args.meeting_id, args.directory, args.open_after)
+        elif args.command == "open": result = open_meeting(args.meeting_id)
+        elif args.command == "open-folder": result = open_export_folder(args.directory)
+        elif args.command == "settings": result = save_options(args.json)
+        elif args.command == "language": result = set_voxtype_language(args.code)
+        else: result = {"ok": False, "error": "The meeting service restarts automatically."}
+        return emit(result, 0 if result.get("ok") else 1)
+    except Exception as exc: return emit({"ok": False, "error": f"Unexpected helper error: {exc}"}, 1)
+
+if __name__ == "__main__": raise SystemExit(main())
