@@ -55,7 +55,7 @@
 
 ## Availability and lifecycle
 
-- Detect a missing or unreachable service and surface actionable errors.
+- Detect a missing or unreachable service and surface an install or start action in the panel.
 - A user systemd service owns capture independently of the bar widget.
 - The installer builds and installs the service, enables it for the user, and leaves system Omarchy files untouched. No sudo or pkexec is required.
 - The matching uninstaller stops the user unit and removes the installed binary and unit file. It does not delete meeting transcripts or Voxtype configuration.

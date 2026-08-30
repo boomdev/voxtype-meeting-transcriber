@@ -7,7 +7,7 @@ An Omarchy Quattro bar widget for local meeting transcription. It preserves utte
 ## Requirements
 
 - Omarchy 4 with the Quattro shell plugin system
-- [Voxtype](https://github.com/cjpais/voxtype) with a supported local engine configured
+- [Voxtype](https://github.com/peteonrails/voxtype) with a supported local engine configured
 - PipeWire or PulseAudio compatibility tools
 - Python 3.11 or newer (plugin helper)
 - Rust toolchain (`cargo`), only when building the capture service
@@ -30,7 +30,7 @@ If the plugin was added without `--enable`, activate it explicitly:
 omarchy plugin enable io.github.boomdev.voxtype-meeting-transcriber --section right
 ```
 
-`omarchy plugin add` only clones and enables the plugin. It does not run install hooks. Build and enable the per-user capture service from the cloned plugin directory:
+`omarchy plugin add` only clones and enables the plugin. It does not run install hooks. Open the panel and use **Install capture service**, or build the per-user capture service from the cloned plugin directory:
 
 ```bash
 ~/.config/omarchy/plugins/io.github.boomdev.voxtype-meeting-transcriber/scripts/install-user.sh
@@ -93,6 +93,14 @@ systemctl --user daemon-reload
 ```
 
 Removal does not delete meeting transcripts, exported Markdown, or Voxtype configuration.
+
+## Troubleshooting
+
+- **The widget is not on the bar:** `omarchy plugin enable io.github.boomdev.voxtype-meeting-transcriber --section right`
+- **The panel says the capture service is missing:** use **Install capture service** in the panel, or run `scripts/install-user.sh` from the cloned plugin directory. Rust's `cargo` is required for that build.
+- **The service is installed but unavailable:** `systemctl --user start voxtype-meeting-service.service`, or use **Start capture service** in the panel.
+- **Language chips do nothing useful:** configure a local Voxtype engine in `~/.config/voxtype/config.toml`. Remote Voxtype engines are rejected for meeting capture.
+- **Changes do not appear after an update:** `omarchy restart shell`
 
 ## Privacy and permissions
 

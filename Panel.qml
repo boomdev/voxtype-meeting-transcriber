@@ -176,6 +176,29 @@ Panel {
     backend.refresh()
   }
 
+  function setCenterHoverRevealSuppressed(value) {
+    if (root.bar && "centerHoverRevealSuppressed" in root.bar)
+      root.bar.centerHoverRevealSuppressed = value
+  }
+
+  function open() {
+    backend.refresh()
+    root.controller.show()
+    Qt.callLater(function() {
+      if (root.opened) root.setCenterHoverRevealSuppressed(true)
+    })
+  }
+
+  function close() {
+    root.setCenterHoverRevealSuppressed(false)
+    root.controller.hide()
+  }
+
+  function toggle() {
+    if (root.opened) root.close()
+    else root.open()
+  }
+
   function switchPanel(direction) {
     if (root.bar && typeof root.bar.switchPanelFrom === "function")
       return root.bar.switchPanelFrom(root.barIdentity, direction)
@@ -510,13 +533,67 @@ Panel {
       }
 
       Text {
-        visible: root.hasError
+        visible: root.hasError && backend.available
         width: parent.width
         text: backend.lastError
         color: root.urgent
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
         wrapMode: Text.WordWrap
+      }
+
+      BorderSurface {
+        visible: !backend.available
+        width: parent.width
+        implicitHeight: setupContent.implicitHeight + Style.space(24)
+        radius: Style.cornerRadius
+        color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
+        borderSpec: Border.controlSpec("normal", root.urgent, root.accent)
+
+        Column {
+          id: setupContent
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.leftMargin: Style.space(12)
+          anchors.rightMargin: Style.space(12)
+          spacing: Style.space(10)
+
+          Text {
+            width: parent.width
+            text: backend.installed
+              ? "The capture service is installed but not running."
+              : "The capture service is not installed yet."
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            width: parent.width
+            text: backend.installed
+              ? (backend.lastError || "Start the user systemd unit, then this panel will reconnect.")
+              : "omarchy plugin add only clones the widget. Build the per-user service once (no sudo)."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Button {
+            width: parent.width
+            text: backend.installed ? "Start capture service" : "Install capture service"
+            iconText: "󰁨"
+            iconRotation: 0
+            selected: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            enabled: !backend.busy
+            onClicked: backend.installed ? backend.startCaptureService() : backend.installCaptureService()
+          }
+        }
       }
 
       RowLayout {

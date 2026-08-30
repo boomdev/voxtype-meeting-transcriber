@@ -8,6 +8,16 @@ set -euo pipefail
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_bin="${CARGO:-$HOME/.cargo/bin/cargo}"
 
+if [[ ! -x "$cargo_bin" ]]; then
+  if command -v cargo >/dev/null 2>&1; then
+    cargo_bin="$(command -v cargo)"
+  else
+    echo "Rust's cargo is required to build voxtype-meeting-service." >&2
+    echo "Install a Rust toolchain (rustup), then run this script again." >&2
+    exit 1
+  fi
+fi
+
 "$cargo_bin" build --release --manifest-path "$project_dir/service/Cargo.toml"
 install -Dm755 "$project_dir/service/target/release/voxtype-meeting-service" "$HOME/.local/bin/voxtype-meeting-service"
 install -Dm644 "$project_dir/service/systemd/voxtype-meeting-service.service" "$HOME/.config/systemd/user/voxtype-meeting-service.service"

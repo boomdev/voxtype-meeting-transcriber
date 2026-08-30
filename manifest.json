@@ -7,7 +7,6 @@
   "license": "MIT",
   "description": "An Omarchy meeting transcriber with ordered local transcription through Voxtype.",
   "kinds": ["bar-widget"],
-  "activation": "on-demand",
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
@@ -22,7 +21,6 @@
       "notificationsEnabled": false,
       "exportDirectory": "~/Documents/Meetings",
       "refreshIntervalSec": 15,
-      "meetingLanguage": "en",
       "enabledLanguages": ["auto", "en"]
     },
     "schema": [
@@ -46,12 +44,6 @@
         "max": 300,
         "step": 5,
         "defaultValue": 15
-      },
-      {
-        "key": "meetingLanguage",
-        "type": "string",
-        "label": "Meeting language",
-        "defaultValue": "en"
       }
     ]
   }

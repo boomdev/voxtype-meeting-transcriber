@@ -5,7 +5,8 @@ import Quickshell.Io
 Item {
   id: root
 
-  property string helperPath: Qt.resolvedUrl("bin/voxtype-meeting-tray").toString().replace(/^file:\/\//, "")
+  property string helperPath: pluginFile("bin/voxtype-meeting-tray")
+  readonly property string installScriptPath: pluginFile("scripts/install-user.sh")
   property string exportDirectory: "~/Documents/Meetings"
   property int idleRefreshSec: 15
   property bool fastRefresh: false
@@ -34,6 +35,27 @@ Item {
   readonly property bool paused: meetingState === "paused"
 
   signal commandFinished(string kind, bool ok, string message, var result)
+
+  function pluginFile(relative) {
+    var url = Qt.resolvedUrl(relative).toString()
+    if (url.indexOf("file://") === 0) {
+      url = url.slice(7)
+      if (url.indexOf("localhost") === 0) url = url.slice(9)
+    }
+    try { return decodeURIComponent(url) } catch (e) { return url }
+  }
+
+  function installCaptureService() {
+    if (installProcess.running || !installScriptPath) return
+    installProcess.command = ["omarchy-launch-floating-terminal-with-presentation", installScriptPath]
+    installProcess.running = true
+  }
+
+  function startCaptureService() {
+    if (startProcess.running) return
+    startProcess.command = ["systemctl", "--user", "start", "voxtype-meeting-service.service"]
+    startProcess.running = true
+  }
 
   function parseJson(text, fallbackError) {
     try {
@@ -237,8 +259,18 @@ Item {
 
   Process { id: notificationProcess }
 
+  Process {
+    id: installProcess
+    onExited: Qt.callLater(root.refresh)
+  }
+
+  Process {
+    id: startProcess
+    onExited: Qt.callLater(root.refresh)
+  }
+
   Timer {
-    interval: (root.active || root.fastRefresh) ? 2000 : Math.max(5, root.idleRefreshSec) * 1000
+    interval: (root.active || root.fastRefresh || !root.available) ? 2000 : Math.max(5, root.idleRefreshSec) * 1000
     running: true
     repeat: true
     onTriggered: root.refresh()
