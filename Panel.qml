@@ -10,6 +10,11 @@ Panel {
   id: root
   moduleName: "io.github.boomdev.voxtype-meeting-transcriber"
   ipcTarget: moduleName
+  manageIpc: false
+
+  property var anchorItem: null
+  property var hostWidget: null
+  readonly property var barIdentity: hostWidget || root
 
   property string page: "meeting"
   property double nowMs: Date.now()
@@ -28,6 +33,8 @@ Panel {
   readonly property color surface: Color.popups.background
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool hasError: backend.lastError !== ""
+  readonly property bool recording: backend.recording
+  readonly property bool paused: backend.paused
   readonly property bool meetingTransition: backend.busy
     && (backend.pendingAction === "start" || backend.pendingAction === "stop")
   readonly property string statusLabel: !backend.available ? "Unavailable"
@@ -160,8 +167,19 @@ Panel {
     for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
     entry[key] = value
     root.settings = entry
+    if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry
     if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
       root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  function refresh() {
+    backend.refresh()
+  }
+
+  function switchPanel(direction) {
+    if (root.bar && typeof root.bar.switchPanelFrom === "function")
+      return root.bar.switchPanelFrom(root.barIdentity, direction)
+    return false
   }
 
   function asStringList(value, fallback) {
@@ -267,9 +285,6 @@ Panel {
     return false
   }
 
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
-
   onOpenedChanged: if (opened) {
     nowMs = Date.now()
     backend.refresh()
@@ -295,55 +310,13 @@ Panel {
     onTriggered: root.nowMs = Date.now()
   }
 
-  BarIconButton {
-    id: button
-    anchors.fill: parent
-    bar: root.bar
-    active: backend.recording || backend.paused || root.hasError
-    activeColor: root.statusColor
-    tooltipText: ""
-    iconComponent: Component {
-      Item {
-        OpticalGlyph {
-          anchors.centerIn: parent
-          width: parent.width
-          height: parent.height
-          text: root.statusGlyph
-          color: root.statusColor
-          fontFamily: root.fontFamily
-          fontSize: Style.bar.iconFont
-        }
-
-        Rectangle {
-          visible: backend.recording
-          width: Style.space(4)
-          height: width
-          radius: width / 2
-          color: root.urgent
-          anchors.right: parent.right
-          anchors.bottom: parent.bottom
-
-          SequentialAnimation on opacity {
-            running: backend.recording
-            loops: Animation.Infinite
-            NumberAnimation { to: 0.25; duration: 650; easing.type: Easing.InOutSine }
-            NumberAnimation { to: 1.0; duration: 650; easing.type: Easing.InOutSine }
-          }
-        }
-      }
-    }
-    onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) backend.refresh()
-      else root.toggle()
-    }
-  }
-
   KeyboardPanel {
     id: panel
-    anchorItem: button
-    owner: root
+    anchorItem: root.anchorItem
+    owner: root.barIdentity
     bar: root.bar
     open: root.opened
+    centerOnBar: true
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(410))
     contentHeight: panel.fittedContentHeight(

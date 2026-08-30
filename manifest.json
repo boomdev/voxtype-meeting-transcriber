@@ -9,7 +9,7 @@
   "kinds": ["bar-widget"],
   "activation": "on-demand",
   "entryPoints": {
-    "barWidget": "Panel.qml"
+    "barWidget": "BarWidget.qml"
   },
   "barWidget": {
     "displayName": "Voxtype Meeting Transcriber",

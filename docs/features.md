@@ -57,8 +57,9 @@
 
 - Detect a missing or unreachable service and surface actionable errors.
 - A user systemd service owns capture independently of the bar widget.
-- The installer builds and installs the service, enables it for the user, and leaves system Omarchy files untouched.
-- The plugin is installed only as user-owned configuration under `~/.config/omarchy/plugins/`.
+- The installer builds and installs the service, enables it for the user, and leaves system Omarchy files untouched. No sudo or pkexec is required.
+- The matching uninstaller stops the user unit and removes the installed binary and unit file. It does not delete meeting transcripts or Voxtype configuration.
+- The plugin is installed and removed with `omarchy plugin add` / `omarchy plugin remove` as user-owned configuration under `~/.config/omarchy/plugins/`.
 
 ## Explicitly excluded
 
