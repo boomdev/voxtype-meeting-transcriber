@@ -91,7 +91,9 @@ class HelperTests(unittest.TestCase):
             cfg = Path(tmp) / "config.toml"
             cfg.write_text('engine = "whisper"\n[whisper]\nmodel = "small"\nlanguage = "en"\n', encoding="utf-8")
             with patch.object(helper, "voxtype_config_path", return_value=cfg):
-                result = helper.set_voxtype_language("fr")
+                with patch.object(helper, "restart_voxtype_daemon", return_value={"ok": True}) as restart:
+                    result = helper.set_voxtype_language("fr")
+            restart.assert_called_once()
             self.assertTrue(result["ok"])
             self.assertEqual(result["language"], "fr")
             self.assertIn('language = "fr"', cfg.read_text(encoding="utf-8"))

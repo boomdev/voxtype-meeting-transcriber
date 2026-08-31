@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import tomllib
 
 APP = "Voxtype Meeting Transcriber"
@@ -172,6 +173,70 @@ def apply_language_override(contents: str, engine: str, language: str) -> str:
         out += "\n"
     return out
 
+
+def voxtype_daemon_info() -> dict:
+    info = {}
+    try:
+        shown = subprocess.run(
+            ["systemctl", "--user", "show", "voxtype.service",
+             "--property=MainPID,ActiveState,ActiveEnterTimestamp,NRestarts"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        for line in shown.stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                info[key] = value.strip()
+        if shown.returncode != 0:
+            info["systemctlError"] = (shown.stderr or shown.stdout).strip()[:200]
+    except Exception as exc:
+        info["error"] = str(exc)
+    try:
+        status = subprocess.run(
+            ["voxtype", "status", "--format", "json", "--extended"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        parsed = json.loads(status.stdout.strip() or "{}")
+        info["statusAlt"] = str(parsed.get("alt") or "")
+        info["statusTooltip"] = str(parsed.get("tooltip") or "")[:180]
+    except Exception as exc:
+        info["statusError"] = str(exc)
+    return info
+
+
+_READY_STATUS = {"idle", "recording", "transcribing", "paused"}
+
+
+def restart_voxtype_daemon() -> dict:
+    result = {"attempted": True, "ok": False}
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "restart", "voxtype.service"],
+            capture_output=True, text=True, timeout=45, check=False,
+        )
+        result["returncode"] = proc.returncode
+        if proc.returncode != 0:
+            result["error"] = (proc.stderr or proc.stdout).strip()[:300] or f"systemctl exited {proc.returncode}"
+            result["daemon"] = voxtype_daemon_info()
+            return result
+        deadline = time.monotonic() + 45
+        last = {}
+        while time.monotonic() < deadline:
+            last = voxtype_daemon_info()
+            alt = str(last.get("statusAlt") or "")
+            if last.get("ActiveState") == "active" and alt in _READY_STATUS:
+                result["ok"] = True
+                result["daemon"] = last
+                return result
+            time.sleep(0.3)
+        result["daemon"] = last
+        result["error"] = "Voxtype daemon restarted but was not ready in time"
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        result["daemon"] = voxtype_daemon_info()
+        return result
+
+
 def set_voxtype_language(code: str) -> dict:
     language = normalize_language_code(code)
     path = voxtype_config_path()
@@ -181,7 +246,7 @@ def set_voxtype_language(code: str) -> dict:
         return {"ok": False, "error": "Voxtype configuration was not found."}
     except OSError as exc:
         return {"ok": False, "error": f"Could not read Voxtype configuration: {exc}"}
-    engine, model, _current = voxtype_summary()
+    engine, model, current = voxtype_summary()
     name = Path(model or "").name.lower()
     if (name.endswith(".en") or ".en." in name) and language != "en":
         return {"ok": False, "error": "This Voxtype model is English-only."}
@@ -195,6 +260,17 @@ def set_voxtype_language(code: str) -> dict:
         tmp.replace(path)
     except OSError as exc:
         return {"ok": False, "error": f"Could not update Voxtype language: {exc}"}
+    _, _, after = voxtype_summary()
+    if after == current and updated == contents:
+        restart = {"ok": True}
+    else:
+        restart = restart_voxtype_daemon()
+    if not restart.get("ok"):
+        return {
+            "ok": False,
+            "error": restart.get("error") or "Could not restart the Voxtype daemon after changing language.",
+            "language": language,
+        }
     return {"ok": True, "message": "Voxtype language updated", "language": language, "engine": engine, "model": model}
 
 def export_sidecar_path(session_dir: str | Path) -> Path:
