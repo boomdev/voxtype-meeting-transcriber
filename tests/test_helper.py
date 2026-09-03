@@ -1,7 +1,10 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -228,5 +231,41 @@ class HelperTests(unittest.TestCase):
         self.assertIn("protocol maximum", result["error"])
         self.assertTrue(sock.timeouts)
         self.assertLessEqual(max(sock.timeouts), helper.CONTROL_IDLE_TIMEOUT_SECS)
+
+    def test_run_capped_captures_small_output(self):
+        result = helper.run_capped(
+            [sys.executable, "-c", "import sys; sys.stdout.write('ready'); sys.stderr.write('warn')"],
+            timeout=2,
+            max_bytes=4096,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "ready")
+        self.assertEqual(result.stderr, "warn")
+
+    def test_run_capped_rejects_overflow_while_streaming(self):
+        start = time.monotonic()
+        with self.assertRaises(helper.SubprocessLimitError) as raised:
+            helper.run_capped(
+                [sys.executable, "-c", "import sys, time; sys.stdout.buffer.write(b'x' * (512 * 1024)); sys.stdout.flush(); time.sleep(10)"],
+                timeout=5,
+                max_bytes=8192,
+            )
+        self.assertEqual(raised.exception.kind, "overflow")
+        self.assertLess(time.monotonic() - start, 4)
+
+    def test_run_capped_timeout_kills_process_group(self):
+        script = (
+            "import subprocess, time\n"
+            "subprocess.Popen(['sleep', '30'])\n"
+            "time.sleep(30)\n"
+        )
+        start = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            helper.run_capped(
+                [sys.executable, "-c", script],
+                timeout=0.4,
+                max_bytes=4096,
+            )
+        self.assertLess(time.monotonic() - start, 4)
 
 if __name__ == "__main__": unittest.main()

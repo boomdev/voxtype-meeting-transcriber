@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -18,6 +21,10 @@ APP = "Voxtype Meeting Transcriber"
 EXPORT_SIDECAR = "export.json"
 CONTROL_IDLE_TIMEOUT_SECS = 30
 CONTROL_MAX_LINE_BYTES = 64 * 1024
+SUBPROCESS_MAX_BYTES = 64 * 1024
+SUBPROCESS_KILL_GRACE_SECS = 2
+VOXTYPE_STATUS_TIMEOUT_SECS = 3
+VOXTYPE_RESTART_TIMEOUT_SECS = 45
 
 # Matches Voxtype's Engine → Whisper · language TUI cycle list (src/tui/engine.rs LANG_CHOICES).
 VOXTYPE_WHISPER_LANGUAGES = [
@@ -41,9 +48,148 @@ DOLPHIN_LANGUAGES = [
 ]
 
 
+class SubprocessLimitError(Exception):
+    def __init__(self, kind: str, stdout: bytes = b"", stderr: bytes = b""):
+        self.kind = kind
+        self.stdout = stdout
+        self.stderr = stderr
+        if kind == "overflow":
+            super().__init__("subprocess output exceeds protocol maximum")
+        else:
+            super().__init__("subprocess timed out")
+
+
 def emit(value: dict, code: int = 0) -> int:
     print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
     return code
+
+
+def _set_nonblocking(stream) -> None:
+    fd = stream.fileno()
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+
+def _kill_process_group(proc: subprocess.Popen, grace: float = SUBPROCESS_KILL_GRACE_SECS) -> None:
+    if proc.pid is None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        proc.wait(timeout=grace)
+    except (subprocess.TimeoutExpired, ChildProcessError):
+        pass
+
+
+def run_capped(
+    command: list[str],
+    *,
+    timeout: float,
+    max_bytes: int = SUBPROCESS_MAX_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    stdout_stream = proc.stdout
+    stderr_stream = proc.stderr
+    if stdout_stream is None or stderr_stream is None:
+        _kill_process_group(proc)
+        raise OSError("subprocess pipes were not created")
+    _set_nonblocking(stdout_stream)
+    _set_nonblocking(stderr_stream)
+    out = bytearray()
+    err = bytearray()
+    open_streams = {stdout_stream, stderr_stream}
+    overflow = False
+    deadline = time.monotonic() + timeout
+    try:
+        while open_streams:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_process_group(proc)
+                raise subprocess.TimeoutExpired(
+                    command, timeout, output=bytes(out), stderr=bytes(err)
+                )
+            wait = remaining if proc.poll() is None else min(remaining, 0.05)
+            ready, _, _ = select.select(list(open_streams), [], [], wait)
+            if not ready:
+                if proc.poll() is not None:
+                    drained = False
+                    for stream in list(open_streams):
+                        try:
+                            leftover = os.read(stream.fileno(), 4096)
+                        except (BlockingIOError, OSError):
+                            leftover = b""
+                        if not leftover:
+                            open_streams.discard(stream)
+                            continue
+                        drained = True
+                        buf = out if stream is stdout_stream else err
+                        room = max_bytes - len(buf)
+                        if room < len(leftover):
+                            if room > 0:
+                                buf.extend(leftover[:room])
+                            overflow = True
+                            _kill_process_group(proc)
+                            open_streams.clear()
+                            break
+                        buf.extend(leftover)
+                    if not drained and not overflow:
+                        open_streams.clear()
+                continue
+            for stream in ready:
+                try:
+                    chunk = os.read(stream.fileno(), 4096)
+                except BlockingIOError:
+                    continue
+                buf = out if stream is stdout_stream else err
+                if not chunk:
+                    open_streams.discard(stream)
+                    continue
+                room = max_bytes - len(buf)
+                if room < len(chunk):
+                    if room > 0:
+                        buf.extend(chunk[:room])
+                    overflow = True
+                    _kill_process_group(proc)
+                    open_streams.clear()
+                    break
+                buf.extend(chunk)
+        wait_left = max(0.05, deadline - time.monotonic())
+        try:
+            returncode = proc.wait(timeout=wait_left)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            raise subprocess.TimeoutExpired(
+                command, timeout, output=bytes(out), stderr=bytes(err)
+            ) from None
+        if overflow:
+            raise SubprocessLimitError("overflow", bytes(out), bytes(err))
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            out.decode("utf-8", errors="replace"),
+            err.decode("utf-8", errors="replace"),
+        )
+    finally:
+        for stream in (stdout_stream, stderr_stream):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        if proc.poll() is None:
+            _kill_process_group(proc)
 
 def runtime_socket() -> Path:
     root = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -205,10 +351,10 @@ def apply_language_override(contents: str, engine: str, language: str) -> str:
 def voxtype_daemon_info() -> dict:
     info = {}
     try:
-        shown = subprocess.run(
+        shown = run_capped(
             ["systemctl", "--user", "show", "voxtype.service",
              "--property=MainPID,ActiveState,ActiveEnterTimestamp,NRestarts"],
-            capture_output=True, text=True, timeout=3, check=False,
+            timeout=VOXTYPE_STATUS_TIMEOUT_SECS,
         )
         for line in shown.stdout.splitlines():
             if "=" in line:
@@ -219,9 +365,9 @@ def voxtype_daemon_info() -> dict:
     except Exception as exc:
         info["error"] = str(exc)
     try:
-        status = subprocess.run(
+        status = run_capped(
             ["voxtype", "status", "--format", "json", "--extended"],
-            capture_output=True, text=True, timeout=3, check=False,
+            timeout=VOXTYPE_STATUS_TIMEOUT_SECS,
         )
         parsed = json.loads(status.stdout.strip() or "{}")
         info["statusAlt"] = str(parsed.get("alt") or "")
@@ -237,16 +383,16 @@ _READY_STATUS = {"idle", "recording", "transcribing", "paused"}
 def restart_voxtype_daemon() -> dict:
     result = {"attempted": True, "ok": False}
     try:
-        proc = subprocess.run(
+        proc = run_capped(
             ["systemctl", "--user", "restart", "voxtype.service"],
-            capture_output=True, text=True, timeout=45, check=False,
+            timeout=VOXTYPE_RESTART_TIMEOUT_SECS,
         )
         result["returncode"] = proc.returncode
         if proc.returncode != 0:
             result["error"] = (proc.stderr or proc.stdout).strip()[:300] or f"systemctl exited {proc.returncode}"
             result["daemon"] = voxtype_daemon_info()
             return result
-        deadline = time.monotonic() + 45
+        deadline = time.monotonic() + VOXTYPE_RESTART_TIMEOUT_SECS
         last = {}
         while time.monotonic() < deadline:
             last = voxtype_daemon_info()

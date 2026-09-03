@@ -1,6 +1,4 @@
 import QtQuick
-import Quickshell
-import Quickshell.Io
 
 Item {
   id: root
@@ -47,13 +45,13 @@ Item {
 
   function installCaptureService() {
     if (installProcess.running || !installScriptPath) return
-    installProcess.command = ["omarchy-launch-floating-terminal-with-presentation", installScriptPath]
+    installProcess.argv = ["omarchy-launch-floating-terminal-with-presentation", installScriptPath]
     installProcess.running = true
   }
 
   function startCaptureService() {
     if (startProcess.running) return
-    startProcess.command = ["systemctl", "--user", "start", "voxtype-meeting-service.service"]
+    startProcess.argv = ["systemctl", "--user", "start", "voxtype-meeting-service.service"]
     startProcess.running = true
   }
 
@@ -63,6 +61,14 @@ Item {
       if (parsed && typeof parsed === "object") return parsed
     } catch (e) {}
     return { ok: false, error: fallbackError || "The Voxtype helper returned invalid data." }
+  }
+
+  function helperResult(proc, fallbackError) {
+    if (proc.overflowed)
+      return { ok: false, error: "The Voxtype helper returned too much data." }
+    if (proc.timedOut)
+      return { ok: false, error: "The Voxtype helper timed out." }
+    return parseJson(proc.stdoutText, proc.stderrText || fallbackError)
   }
 
   function applySnapshot(data) {
@@ -109,7 +115,7 @@ Item {
   function openExportFolder() {
     if (folderProcess.running) return
     lastError = ""
-    folderProcess.command = [helperPath, "open-folder", "--directory", exportDirectory]
+    folderProcess.argv = [helperPath, "open-folder", "--directory", exportDirectory]
     folderProcess.running = true
   }
 
@@ -134,7 +140,7 @@ Item {
     pendingSettings = null
     settingsBusy = true
     lastError = ""
-    settingsProcess.command = [helperPath, "settings", JSON.stringify(values)]
+    settingsProcess.argv = [helperPath, "settings", JSON.stringify(values)]
     settingsProcess.running = true
   }
 
@@ -149,7 +155,7 @@ Item {
     revision++
     languageBusy = true
     lastError = ""
-    languageProcess.command = [helperPath, "language", language]
+    languageProcess.argv = [helperPath, "language", language]
     languageProcess.running = true
   }
 
@@ -165,7 +171,7 @@ Item {
       : kind.charAt(0).toUpperCase() + kind.slice(1) + "ing…"
     lastError = ""
     actionProcess.kind = kind
-    actionProcess.command = command
+    actionProcess.argv = command
     actionProcess.running = true
   }
 
@@ -174,30 +180,28 @@ Item {
     var headline = ok ? "Voxtype Meeting" : "Voxtype Meeting Error"
     var body = message
     var glyph = ok ? "󰍬" : "󰅚"
-    notificationProcess.command = ["omarchy-notification-send", "--app-name", "Voxtype Meeting Transcriber",
-                                   "-g", glyph, "-u", ok ? "low" : "critical", headline, body]
+    notificationProcess.argv = ["omarchy-notification-send", "--app-name", "Voxtype Meeting Transcriber",
+                                "-g", glyph, "-u", ok ? "low" : "critical", headline, body]
     if (!notificationProcess.running) notificationProcess.running = true
   }
 
-  Process {
+  CappedProcess {
     id: snapshotProcess
-    command: [root.helperPath, "snapshot"]
-    stdout: StdioCollector { id: snapshotOutput; waitForEnd: true }
-    stderr: StdioCollector { id: snapshotError; waitForEnd: true }
+    timeoutSec: 15
+    argv: [root.helperPath, "snapshot"]
     onExited: function(code) {
-      var data = root.parseJson(snapshotOutput.text, snapshotError.text || "Could not inspect Voxtype.")
+      var data = root.helperResult(snapshotProcess, "Could not inspect Voxtype.")
       if (data.ok === true) root.applySnapshot(data)
       else root.lastError = String(data.error || "Could not inspect Voxtype.")
     }
   }
 
-  Process {
+  CappedProcess {
     id: actionProcess
     property string kind: ""
-    stdout: StdioCollector { id: actionOutput; waitForEnd: true }
-    stderr: StdioCollector { id: actionError; waitForEnd: true }
+    timeoutSec: 45
     onExited: function(code) {
-      var data = root.parseJson(actionOutput.text, actionError.text || "Voxtype command failed.")
+      var data = root.helperResult(actionProcess, "Voxtype command failed.")
       var ok = data.ok === true
       var message = ok ? String(data.message || "Done") : String(data.error || "Voxtype command failed.")
       root.busy = false
@@ -210,12 +214,11 @@ Item {
     }
   }
 
-  Process {
+  CappedProcess {
     id: settingsProcess
-    stdout: StdioCollector { id: settingsOutput; waitForEnd: true }
-    stderr: StdioCollector { id: settingsError; waitForEnd: true }
+    timeoutSec: 15
     onExited: function(code) {
-      var data = root.parseJson(settingsOutput.text, settingsError.text || "Could not save meeting options.")
+      var data = root.helperResult(settingsProcess, "Could not save meeting options.")
       root.settingsBusy = false
       if (data.ok === true) {
         if (!root.busy) root.lastError = ""
@@ -227,12 +230,11 @@ Item {
     }
   }
 
-  Process {
+  CappedProcess {
     id: languageProcess
-    stdout: StdioCollector { id: languageOutput; waitForEnd: true }
-    stderr: StdioCollector { id: languageError; waitForEnd: true }
+    timeoutSec: 60
     onExited: function(code) {
-      var data = root.parseJson(languageOutput.text, languageError.text || "Could not update Voxtype language.")
+      var data = root.helperResult(languageProcess, "Could not update Voxtype language.")
       root.languageBusy = false
       if (data.ok === true) {
         if (!root.busy) root.lastError = ""
@@ -243,12 +245,11 @@ Item {
     }
   }
 
-  Process {
+  CappedProcess {
     id: folderProcess
-    stdout: StdioCollector { id: folderOutput; waitForEnd: true }
-    stderr: StdioCollector { id: folderError; waitForEnd: true }
+    timeoutSec: 10
     onExited: function(code) {
-      var data = root.parseJson(folderOutput.text, folderError.text || "Could not open the transcripts folder.")
+      var data = root.helperResult(folderProcess, "Could not open the transcripts folder.")
       if (data.ok === true) {
         if (!root.busy) root.lastError = ""
       } else {
@@ -257,15 +258,23 @@ Item {
     }
   }
 
-  Process { id: notificationProcess }
+  CappedProcess {
+    id: notificationProcess
+    timeoutSec: 5
+    maxBytes: 65536
+  }
 
-  Process {
+  CappedProcess {
     id: installProcess
+    timeoutSec: 20
+    maxBytes: 65536
     onExited: Qt.callLater(root.refresh)
   }
 
-  Process {
+  CappedProcess {
     id: startProcess
+    timeoutSec: 10
+    maxBytes: 65536
     onExited: Qt.callLater(root.refresh)
   }
 
