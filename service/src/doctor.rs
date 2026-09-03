@@ -3,7 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use crate::audio::{AudioBackend, PulseAudioBackend};
-use crate::config::{openai_api_key, Config};
+use crate::config::Config;
 use crate::distro::{DistroInfo, LinuxDistribution};
 use crate::error::Result;
 use crate::paths::PathResolver;
@@ -120,7 +120,6 @@ fn collect_checks(paths: &PathResolver, distro: &DistroInfo) -> Vec<Check> {
     checks.push(check_database(paths));
     checks.push(check_disk(paths, config.as_ref()));
     checks.push(check_systemd());
-    checks.push(check_openai(config.as_ref()));
     checks.push(check_whisper(config.as_ref()));
     checks.push(check_whisper_model(config.as_ref()));
     checks.push(check_ui_runtime());
@@ -133,7 +132,6 @@ fn check_id(name: &str) -> &'static str {
         "Default microphone" => "microphone",
         "Default output sink" => "system_output",
         "Default output monitor" => "system_monitor",
-        "OpenAI API key" => "openai",
         "whisper-cli" => "whisper_cpp",
         "whisper model" => "local_model",
         "Database" => "database",
@@ -385,34 +383,6 @@ fn check_systemd() -> Check {
     }
 }
 
-fn check_openai(config: Option<&Config>) -> Check {
-    let provider = config.map(|config| config.transcription.provider);
-    match provider {
-        Some(crate::config::ProviderKind::Openai) | None => {
-            if openai_api_key().is_some() {
-                Check {
-                    name: "OpenAI API key",
-                    status: CheckStatus::Pass,
-                    detail: "OPENAI_API_KEY is set".into(),
-                }
-            } else {
-                Check {
-                    name: "OpenAI API key",
-                    status: CheckStatus::Warn,
-                    detail:
-                        "OPENAI_API_KEY is missing; capture still works, OpenAI jobs stay pending"
-                            .into(),
-                }
-            }
-        }
-        Some(_) => Check {
-            name: "OpenAI API key",
-            status: CheckStatus::Pass,
-            detail: "not required for whisper_cpp".into(),
-        },
-    }
-}
-
 fn check_whisper(config: Option<&Config>) -> Check {
     let Some(config) = config else {
         return Check {
@@ -425,7 +395,7 @@ fn check_whisper(config: Option<&Config>) -> Check {
         return Check {
             name: "whisper-cli",
             status: CheckStatus::Pass,
-            detail: "N/A (provider is openai)".into(),
+            detail: "N/A (provider is not whisper_cpp)".into(),
         };
     }
     let path = &config.transcription.whisper_cpp.executable;
@@ -467,7 +437,7 @@ fn check_whisper_model(config: Option<&Config>) -> Check {
         return Check {
             name: "whisper model",
             status: CheckStatus::Pass,
-            detail: "N/A (provider is openai)".into(),
+            detail: "N/A (provider is not whisper_cpp)".into(),
         };
     }
     let path = &config.transcription.whisper_cpp.model;

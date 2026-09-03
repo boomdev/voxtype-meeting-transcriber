@@ -170,7 +170,7 @@ fn processing_job_recovers_to_pending() {
             voxtype_meeting_service::storage::sessions::insert_run(
                 conn,
                 &session_id,
-                voxtype_meeting_service::config::ProviderKind::Openai,
+                voxtype_meeting_service::config::ProviderKind::Voxtype,
                 "m",
             )
         })
@@ -183,7 +183,7 @@ fn processing_job_recovers_to_pending() {
         PersistChunk {
             session_id: &session_id,
             run_id: &run.id,
-            provider: voxtype_meeting_service::config::ProviderKind::Openai,
+            provider: voxtype_meeting_service::config::ProviderKind::Voxtype,
             model: "m",
             dir: &mic_dir,
             source: AudioSource::Mic,
@@ -220,7 +220,7 @@ fn duplicate_success_inserts_one_event() {
             voxtype_meeting_service::storage::sessions::insert_run(
                 conn,
                 &session_id,
-                voxtype_meeting_service::config::ProviderKind::Openai,
+                voxtype_meeting_service::config::ProviderKind::Voxtype,
                 "m",
             )
         })
@@ -233,7 +233,7 @@ fn duplicate_success_inserts_one_event() {
         PersistChunk {
             session_id: &session_id,
             run_id: &run.id,
-            provider: voxtype_meeting_service::config::ProviderKind::Openai,
+            provider: voxtype_meeting_service::config::ProviderKind::Voxtype,
             model: "m",
             dir: &mic_dir,
             source: AudioSource::Mic,
@@ -250,7 +250,7 @@ fn duplicate_success_inserts_one_event() {
         .unwrap();
     let result = TranscriptionResult {
         text: "once".into(),
-        provider: voxtype_meeting_service::config::ProviderKind::Openai,
+        provider: voxtype_meeting_service::config::ProviderKind::Voxtype,
         model: "m".into(),
         provider_metadata: None,
     };
@@ -284,7 +284,7 @@ fn delayed_speech_shifts_event_off_chunk_start() {
             voxtype_meeting_service::storage::sessions::insert_run(
                 conn,
                 &session_id,
-                voxtype_meeting_service::config::ProviderKind::Openai,
+                voxtype_meeting_service::config::ProviderKind::Voxtype,
                 "m",
             )
         })
@@ -302,7 +302,7 @@ fn delayed_speech_shifts_event_off_chunk_start() {
         PersistChunk {
             session_id: &session_id,
             run_id: &run.id,
-            provider: voxtype_meeting_service::config::ProviderKind::Openai,
+            provider: voxtype_meeting_service::config::ProviderKind::Voxtype,
             model: "m",
             dir: &mic_dir,
             source: AudioSource::Mic,
@@ -319,7 +319,7 @@ fn delayed_speech_shifts_event_off_chunk_start() {
         .unwrap();
     let result = TranscriptionResult {
         text: "Voilà, ça veut pas".into(),
-        provider: voxtype_meeting_service::config::ProviderKind::Openai,
+        provider: voxtype_meeting_service::config::ProviderKind::Voxtype,
         model: "m".into(),
         provider_metadata: None,
     };

@@ -146,7 +146,7 @@ pub fn job_from_row(row: &rusqlite::Row<'_>) -> Result<TranscriptionJobRecord> {
         id: row.get(0)?,
         audio_chunk_id: row.get(1)?,
         run_id: row.get(2)?,
-        provider: ProviderKind::parse(&row.get::<_, String>(3)?)?,
+        provider: ProviderKind::parse_stored(&row.get::<_, String>(3)?)?,
         model: row.get(4)?,
         state: JobState::parse(&row.get::<_, String>(5)?)?,
         attempt_count: row.get(6)?,

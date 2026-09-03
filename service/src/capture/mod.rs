@@ -150,13 +150,7 @@ fn warn_if_transcription_unready(config: &Config) {
                 tracing::warn!("voxtype is unavailable; captured turns will remain queued");
             }
         }
-        crate::config::ProviderKind::Openai => {
-            if crate::config::openai_api_key().is_none() {
-                tracing::warn!(
-                    "OPENAI_API_KEY is not set; capture will continue and OpenAI jobs will stay pending until the key is available"
-                );
-            }
-        }
+        crate::config::ProviderKind::Openai => {}
         crate::config::ProviderKind::WhisperCpp => {
             let executable = &config.transcription.whisper_cpp.executable;
             let model = &config.transcription.whisper_cpp.model;

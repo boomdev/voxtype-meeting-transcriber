@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::process::Command;
-use tokio::time::timeout;
 
 use crate::config::ProviderKind;
 use crate::error::{AppError, Result};
+use crate::transcription::bounded::{
+    check_audio_file_size, limit_transcript, read_capped_bytes_sync, run_capped_command,
+    CONFIG_MAX_BYTES, MEETING_LANGUAGE_MAX_BYTES,
+};
 use crate::transcription::{AudioChunkRef, TranscriptionProvider, TranscriptionResult};
 
 const TIMEOUT: Duration = Duration::from_secs(600);
@@ -24,11 +26,22 @@ impl VoxtypeProvider {
 
 pub fn snapshot_config(home: &Path, session_dir: &Path, language: Option<&str>) -> Result<String> {
     let source = home.join(".config/voxtype/config.toml");
-    let contents = match std::fs::read_to_string(&source) {
-        Ok(value) => value,
+    let contents = match read_capped_bytes_sync(&source, CONFIG_MAX_BYTES) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|error| {
+            AppError::config(format!(
+                "Voxtype config {} was not valid UTF-8: {error}",
+                source.display()
+            ))
+        })?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             "engine = \"whisper\"\n[whisper]\nmodel = \"base.en\"\nlanguage = \"auto\"\n"
                 .to_string()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(AppError::config(format!(
+                "Voxtype config {} exceeds the {CONFIG_MAX_BYTES} byte limit",
+                source.display()
+            )))
         }
         Err(error) => {
             return Err(AppError::config(format!(
@@ -82,8 +95,12 @@ pub fn snapshot_config(home: &Path, session_dir: &Path, language: Option<&str>) 
 }
 
 fn read_meeting_language(session_dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(session_dir.join(MEETING_LANGUAGE_FILE)).ok()?;
-    let code = text.trim();
+    let bytes = read_capped_bytes_sync(
+        &session_dir.join(MEETING_LANGUAGE_FILE),
+        MEETING_LANGUAGE_MAX_BYTES,
+    )
+    .ok()?;
+    let code = std::str::from_utf8(&bytes).ok()?.trim();
     if code.is_empty() {
         None
     } else {
@@ -177,6 +194,7 @@ impl TranscriptionProvider for VoxtypeProvider {
         }
         let temp_dir = std::env::temp_dir().join(format!("voxtype-meeting-{}", chunk.id));
         tokio::fs::create_dir_all(&temp_dir).await?;
+        check_audio_file_size(&chunk.file_path)?;
         let wav = temp_dir.join("utterance.wav");
         let flac = chunk.file_path.clone();
         let wav_copy = wav.clone();
@@ -192,17 +210,15 @@ impl TranscriptionProvider for VoxtypeProvider {
             &wav,
             read_meeting_language(&session_dir).as_deref(),
         );
-        let child = Command::new("voxtype")
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| AppError::transcription(format!("could not start voxtype: {e}")))?;
-        let output = timeout(TIMEOUT, child.wait_with_output())
-            .await
-            .map_err(|_| AppError::transcription("voxtype transcribe timed out"))?
-            .map_err(|e| AppError::transcription(format!("voxtype failed: {e}")))?;
+        let mut command = Command::new("voxtype");
+        command.args(&args);
+        let output = match run_capped_command(command, TIMEOUT).await {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                return Err(error);
+            }
+        };
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -214,7 +230,7 @@ impl TranscriptionProvider for VoxtypeProvider {
         }
         let text = parse_output(&String::from_utf8_lossy(&output.stdout));
         Ok(TranscriptionResult {
-            text,
+            text: limit_transcript(text)?,
             provider: ProviderKind::Voxtype,
             model: self.model.clone(),
             provider_metadata: None,
@@ -273,6 +289,21 @@ mod tests {
         assert!(updated.contains("[sensevoice]"));
         assert!(updated.contains("language = \"ja\""));
         assert!(updated.contains("model = \"sensevoice-small\""));
+    }
+
+    #[test]
+    fn snapshot_rejects_oversized_config() {
+        let home = tempfile::tempdir().unwrap();
+        let config_dir = home.path().join(".config/voxtype");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            vec![b'x'; crate::transcription::bounded::CONFIG_MAX_BYTES + 1],
+        )
+        .unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let error = snapshot_config(home.path(), session.path(), None).unwrap_err();
+        assert!(error.to_string().contains("exceeds"), "{error}");
     }
 
     #[test]

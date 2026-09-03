@@ -244,7 +244,7 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> Result<TranscriptEventRecord> {
         started_at: row.get(6)?,
         ended_at: row.get(7)?,
         text: row.get(8)?,
-        provider: ProviderKind::parse(&row.get::<_, String>(9)?)?,
+        provider: ProviderKind::parse_stored(&row.get::<_, String>(9)?)?,
         model: row.get(10)?,
         is_canonical: row.get::<_, i64>(11)? == 1,
         created_at: row.get(12)?,
@@ -315,5 +315,5 @@ pub fn get_job_provider(
         params![job_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    Ok((ProviderKind::parse(&provider)?, model, chunk_id))
+    Ok((ProviderKind::parse_stored(&provider)?, model, chunk_id))
 }

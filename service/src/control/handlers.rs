@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use crate::audio::AudioDevice;
-use crate::config::{apply_patch, openai_api_key, write_atomic, Config, ConfigPatch, ProviderKind};
+use crate::config::{apply_patch, write_atomic, Config, ConfigPatch, ProviderKind};
 use crate::control::protocol::{encode_ok, encode_response, Request, Response};
 use crate::control::ControlExtras;
 use crate::daemon::StopOutcome;
@@ -225,7 +225,6 @@ fn get_state(
             "message": attention,
         },
         "recent_sessions": recent,
-        "openai_api_key_available": openai_api_key().is_some(),
     })))
 }
 
@@ -242,14 +241,6 @@ fn panel_state(recording: bool, processing: i64, attention: bool) -> &'static st
 }
 
 fn panel_attention(config: &Config, pending: i64, db: &Db) -> Result<Option<String>> {
-    if config.transcription.provider == ProviderKind::Openai
-        && openai_api_key().is_none()
-        && pending > 0
-    {
-        return Ok(Some(
-            "OpenAI is selected but OPENAI_API_KEY is not available".into(),
-        ));
-    }
     if config.transcription.provider == ProviderKind::WhisperCpp {
         let executable = &config.transcription.whisper_cpp.executable;
         if !executable.exists() && pending > 0 {
@@ -620,7 +611,6 @@ fn get_config(paths: &PathResolver, extras: Option<&ControlExtras>) -> Result<St
     let distro = crate::distro::DistroInfo::detect()
         .unwrap_or_else(|_| crate::distro::DistroInfo::from_os_release(""));
     Ok(encode_ok(json!({
-        "openai_api_key_available": openai_api_key().is_some(),
         "daemon_version": env!("CARGO_PKG_VERSION"),
         "desktop_environment": std::env::var("XDG_CURRENT_DESKTOP").ok(),
         "distribution": distro.pretty_name(),

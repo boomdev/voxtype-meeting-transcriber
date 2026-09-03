@@ -65,14 +65,14 @@ pub enum RecordCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "snake_case")]
 pub enum ProviderArg {
-    Openai,
+    Voxtype,
     WhisperCpp,
 }
 
 impl From<ProviderArg> for ProviderKind {
     fn from(value: ProviderArg) -> Self {
         match value {
-            ProviderArg::Openai => ProviderKind::Openai,
+            ProviderArg::Voxtype => ProviderKind::Voxtype,
             ProviderArg::WhisperCpp => ProviderKind::WhisperCpp,
         }
     }

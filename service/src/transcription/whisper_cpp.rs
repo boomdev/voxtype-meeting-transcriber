@@ -1,13 +1,14 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::process::Command;
-use tokio::time::timeout;
 
 use crate::config::{Config, ProviderKind};
 use crate::error::{AppError, Result};
+use crate::transcription::bounded::{
+    check_audio_file_size, limit_transcript, read_capped_file, run_capped_command, JSON_MAX_BYTES,
+};
 use crate::transcription::{AudioChunkRef, TranscriptionProvider, TranscriptionResult};
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(600);
@@ -61,6 +62,7 @@ impl WhisperCppProvider {
                 flac.display()
             )));
         }
+        check_audio_file_size(flac)?;
         Ok(())
     }
 }
@@ -136,20 +138,8 @@ async fn run_whisper(
         .arg("-np")
         .arg("-oj")
         .arg("-of")
-        .arg(prefix)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let child = command.spawn().map_err(|error| {
-        AppError::transcription(format!(
-            "failed to start whisper-cli {}: {error}",
-            executable.display()
-        ))
-    })?;
-    let output = timeout(PROCESS_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| AppError::transcription("whisper-cli timed out after 10 minutes".to_string()))?
-        .map_err(|error| AppError::transcription(format!("whisper-cli process failed: {error}")))?;
+        .arg(prefix);
+    let output = run_capped_command(command, PROCESS_TIMEOUT).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let tail: String = stderr
@@ -166,15 +156,14 @@ async fn run_whisper(
         )));
     }
     let json_path = prefix.with_extension("json");
-    let json = tokio::fs::read_to_string(&json_path)
-        .await
-        .map_err(|error| {
-            AppError::transcription(format!(
-                "whisper-cli did not write JSON output {}: {error}",
-                json_path.display()
-            ))
-        })?;
-    parse_whisper_json(&json)
+    let json = read_capped_file(&json_path, JSON_MAX_BYTES).await?;
+    let json = std::str::from_utf8(&json).map_err(|error| {
+        AppError::transcription(format!(
+            "whisper-cli JSON {} was not valid UTF-8: {error}",
+            json_path.display()
+        ))
+    })?;
+    parse_whisper_json(json)
 }
 
 async fn decode_and_retry_wav(
@@ -204,10 +193,10 @@ fn parse_whisper_json(json: &str) -> Result<String> {
         AppError::transcription(format!("whisper-cli JSON was invalid: {error}"))
     })?;
     if let Some(text) = value.get("transcription").and_then(|v| v.as_str()) {
-        return Ok(text.trim().to_string());
+        return limit_transcript(text.trim().to_string());
     }
     if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
-        return Ok(text.trim().to_string());
+        return limit_transcript(text.trim().to_string());
     }
     if let Some(segments) = value
         .pointer("/result/segments")
@@ -221,7 +210,7 @@ fn parse_whisper_json(json: &str) -> Result<String> {
             .join("")
             .trim()
             .to_string();
-        return Ok(text);
+        return limit_transcript(text);
     }
     Err(AppError::transcription(
         "whisper-cli JSON did not contain transcription text",

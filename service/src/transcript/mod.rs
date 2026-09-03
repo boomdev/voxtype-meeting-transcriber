@@ -178,8 +178,8 @@ mod tests {
             started_at: started.into(),
             ended_at: started.into(),
             text: text.into(),
-            provider: ProviderKind::Openai,
-            model: "gpt-4o-transcribe".into(),
+            provider: ProviderKind::Voxtype,
+            model: "configured".into(),
             is_canonical: true,
             created_at: started.into(),
         }
@@ -306,6 +306,6 @@ mod tests {
         assert_eq!(value["source"], "mic");
         assert_eq!(value["sequence"], 12);
         assert_eq!(value["text"], "hello");
-        assert_eq!(value["provider"], "openai");
+        assert_eq!(value["provider"], "voxtype");
     }
 }

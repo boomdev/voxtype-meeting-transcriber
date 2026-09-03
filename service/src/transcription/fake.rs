@@ -15,7 +15,7 @@ pub struct FakeTranscriptionProvider {
 impl FakeTranscriptionProvider {
     pub fn always(text: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            kind: ProviderKind::Openai,
+            kind: ProviderKind::Voxtype,
             text: text.into(),
             fail_times: 0,
             attempts: AtomicUsize::new(0),
@@ -24,7 +24,7 @@ impl FakeTranscriptionProvider {
 
     pub fn fail_then_succeed(fail_times: usize, text: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            kind: ProviderKind::Openai,
+            kind: ProviderKind::Voxtype,
             text: text.into(),
             fail_times,
             attempts: AtomicUsize::new(0),

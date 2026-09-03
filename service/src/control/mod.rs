@@ -391,7 +391,7 @@ mod tests {
         let db = crate::storage::Db::open(paths.db_path()).unwrap();
         drop(db);
         let socket = bind_or_fail(&paths).await.unwrap();
-        let status = Arc::new(Mutex::new(RuntimeStatus::new(ProviderKind::Openai)));
+        let status = Arc::new(Mutex::new(RuntimeStatus::new(ProviderKind::Voxtype)));
         {
             let mut s = status.lock().unwrap();
             s.session_id = Some("sess".into());
@@ -483,7 +483,7 @@ mod tests {
         let db = crate::storage::Db::open(paths.db_path()).unwrap();
         drop(db);
         let socket = bind_or_fail(&paths).await.unwrap();
-        let status = Arc::new(Mutex::new(RuntimeStatus::new(ProviderKind::Openai)));
+        let status = Arc::new(Mutex::new(RuntimeStatus::new(ProviderKind::Voxtype)));
         let shutdown = CancellationToken::new();
         let server = {
             let paths = paths.clone();

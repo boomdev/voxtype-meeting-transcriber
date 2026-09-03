@@ -106,7 +106,9 @@ Removal does not delete meeting transcripts, exported Markdown, or Voxtype confi
 
 The plugin and capture service run as your user, unsandboxed, inside Omarchy's shell process and a user systemd unit. No sudo or pkexec is required.
 
-The helper talks to `voxtype-meeting-service` over a Unix socket under `$XDG_RUNTIME_DIR`. It reads Voxtype's config to show the engine, model, and languages, and it rewrites the language field in that file only after an explicit language-chip click. Capture audio, transcripts, and the service database stay on the local machine.
+The helper talks to `voxtype-meeting-service` over a Unix socket under `$XDG_RUNTIME_DIR`. It reads Voxtype's config to show the engine, model, and languages, and it rewrites the language field in that file only after an explicit language-chip click.
+
+Transcription is local only. The capture service runs Voxtype or whisper.cpp on this machine and never uploads captured audio. Capture audio, transcripts, and the service database stay on the local machine.
 
 ## Development and validation
 

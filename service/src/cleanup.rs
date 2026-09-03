@@ -201,7 +201,7 @@ mod tests {
             .unwrap();
         let run = db
             .with_conn(|conn| {
-                crate::storage::sessions::insert_run(conn, &session_id, ProviderKind::Openai, "m")
+                crate::storage::sessions::insert_run(conn, &session_id, ProviderKind::Voxtype, "m")
             })
             .unwrap();
         let mic_dir = paths.session_dir(&session_id).join("audio/mic");
@@ -212,7 +212,7 @@ mod tests {
             crate::storage::PersistChunk {
                 session_id: &session_id,
                 run_id: &run.id,
-                provider: ProviderKind::Openai,
+                provider: ProviderKind::Voxtype,
                 model: "m",
                 dir: &mic_dir,
                 source: AudioSource::Mic,
@@ -236,7 +236,7 @@ mod tests {
                 .unwrap();
             let result = crate::transcription::TranscriptionResult {
                 text: "hi".into(),
-                provider: ProviderKind::Openai,
+                provider: ProviderKind::Voxtype,
                 model: "m".into(),
                 provider_metadata: None,
             };

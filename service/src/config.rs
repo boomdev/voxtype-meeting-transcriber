@@ -53,11 +53,20 @@ impl ProviderKind {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "voxtype" => Ok(Self::Voxtype),
-            "openai" => Ok(Self::Openai),
             "whisper_cpp" => Ok(Self::WhisperCpp),
+            "openai" => Err(AppError::config(
+                "the OpenAI remote provider has been removed; use provider = \"voxtype\" or \"whisper_cpp\"",
+            )),
             other => Err(AppError::config(format!(
-                "invalid transcription.provider '{other}'; expected voxtype, openai or whisper_cpp"
+                "invalid transcription.provider '{other}'; expected voxtype or whisper_cpp"
             ))),
+        }
+    }
+
+    pub fn parse_stored(value: &str) -> Result<Self> {
+        match value {
+            "openai" => Ok(Self::Openai),
+            other => Self::parse(other),
         }
     }
 }
@@ -309,8 +318,7 @@ impl Config {
 
     pub fn model_for_provider(&self, provider: ProviderKind) -> String {
         match provider {
-            ProviderKind::Voxtype => self.transcription.model.clone(),
-            ProviderKind::Openai => self.transcription.model.clone(),
+            ProviderKind::Voxtype | ProviderKind::Openai => self.transcription.model.clone(),
             ProviderKind::WhisperCpp => self
                 .transcription
                 .whisper_cpp
@@ -406,19 +414,6 @@ pub fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// True when the OpenAI model takes the `languages[]` multipart field instead of `language`.
-pub fn openai_uses_languages_array(model: &str) -> bool {
-    let stem = model
-        .rsplit('/')
-        .next()
-        .unwrap_or(model)
-        .to_ascii_lowercase();
-    stem == "gpt-transcribe"
-        || stem.starts_with("gpt-transcribe-")
-        || stem == "gpt-live-transcribe"
-        || stem.starts_with("gpt-live-transcribe-")
-}
-
 pub fn whisper_cli_language(languages: &[String]) -> Result<String> {
     match languages {
         [] => Ok("auto".to_string()),
@@ -431,21 +426,13 @@ pub fn whisper_cli_language(languages: &[String]) -> Result<String> {
 
 pub fn assert_languages_compatible(
     provider: ProviderKind,
-    model: &str,
+    _model: &str,
     languages: &[String],
 ) -> Result<()> {
     match provider {
-        ProviderKind::Voxtype => Ok(()),
+        ProviderKind::Voxtype | ProviderKind::Openai => Ok(()),
         ProviderKind::WhisperCpp => {
             whisper_cli_language(languages)?;
-            Ok(())
-        }
-        ProviderKind::Openai => {
-            if languages.len() > 1 && !openai_uses_languages_array(model) {
-                return Err(AppError::config(format!(
-                    "OpenAI model '{model}' accepts at most one language code; use model = \"gpt-transcribe\" for several languages, or languages = [\"fr\"]"
-                )));
-            }
             Ok(())
         }
     }
@@ -482,14 +469,6 @@ fn normalize_languages(raw: Option<Vec<String>>) -> Result<Vec<String>> {
         ));
     }
     Ok(out)
-}
-
-/// Reads the OpenAI API key from the environment. Never log the return value.
-pub fn openai_api_key() -> Option<String> {
-    match env::var("OPENAI_API_KEY") {
-        Ok(value) if !value.is_empty() => Some(value),
-        _ => None,
-    }
 }
 
 pub fn to_toml(config: &Config) -> String {
@@ -759,9 +738,9 @@ provider = "foo"
 "#;
         let error = parse_toml_with_home(toml, Path::new("/home/xa")).unwrap_err();
         assert!(
-            error.to_string().contains(
-                "invalid transcription.provider 'foo'; expected voxtype, openai or whisper_cpp"
-            ),
+            error
+                .to_string()
+                .contains("invalid transcription.provider 'foo'; expected voxtype or whisper_cpp"),
             "{error}"
         );
     }
@@ -788,15 +767,22 @@ model = "~/models/x.bin"
     }
 
     #[test]
-    fn languages_array_for_gpt_transcribe() {
+    fn reject_removed_openai_provider() {
         let toml = r#"
 [transcription]
 provider = "openai"
-model = "gpt-transcribe"
-languages = ["FR", "en"]
 "#;
-        let config = parse_toml_with_home(toml, Path::new("/home/xa")).expect("parse");
-        assert_eq!(config.transcription.languages, vec!["fr", "en"]);
+        let error = parse_toml_with_home(toml, Path::new("/home/xa")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("OpenAI remote provider has been removed"),
+            "{error}"
+        );
+        assert_eq!(
+            super::ProviderKind::parse_stored("openai").unwrap(),
+            super::ProviderKind::Openai
+        );
     }
 
     #[test]
@@ -821,21 +807,6 @@ languages = ["fr", "en"]
             error
                 .to_string()
                 .contains("whisper.cpp accepts at most one language"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn gpt_4o_transcribe_rejects_multiple_languages() {
-        let toml = r#"
-[transcription]
-provider = "openai"
-model = "gpt-4o-transcribe"
-languages = ["fr", "en"]
-"#;
-        let error = parse_toml_with_home(toml, Path::new("/home/xa")).unwrap_err();
-        assert!(
-            error.to_string().contains("accepts at most one language"),
             "{error}"
         );
     }
@@ -890,17 +861,6 @@ languages = ["fr/en"]
             error.to_string().contains("invalid language code"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn openai_array_models() {
-        assert!(super::openai_uses_languages_array("gpt-transcribe"));
-        assert!(super::openai_uses_languages_array(
-            "gpt-transcribe-2025-12-15"
-        ));
-        assert!(super::openai_uses_languages_array("gpt-live-transcribe"));
-        assert!(!super::openai_uses_languages_array("gpt-4o-transcribe"));
-        assert!(!super::openai_uses_languages_array("whisper-1"));
     }
 
     #[test]

@@ -95,7 +95,7 @@ pub fn latest_run(conn: &Connection, session_id: &str) -> Result<Option<Transcri
         Ok(Some(TranscriptionRunRecord {
             id: row.get(0)?,
             session_id: row.get(1)?,
-            provider: ProviderKind::parse(&row.get::<_, String>(2)?)?,
+            provider: ProviderKind::parse_stored(&row.get::<_, String>(2)?)?,
             model: row.get(3)?,
             created_at: row.get(4)?,
         }))

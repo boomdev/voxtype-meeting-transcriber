@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 
-use crate::config::{openai_api_key, Config, ProviderKind};
+use crate::config::{Config, ProviderKind};
 use crate::storage::types::{
     AudioChunkRecord, JobState, SessionRecord, SessionState, TranscriptionJobRecord,
 };
@@ -44,14 +44,12 @@ impl UiSessionStatus {
 pub struct StatusContext<'a> {
     pub config: &'a Config,
     pub now: DateTime<Utc>,
-    pub openai_key_available: bool,
 }
 
 pub fn status_context(config: &Config) -> StatusContext<'_> {
     StatusContext {
         config,
         now: Utc::now(),
-        openai_key_available: openai_api_key().is_some(),
     }
 }
 
@@ -130,11 +128,9 @@ pub fn attention_reason(
                 }
             }
             ProviderKind::Openai => {
-                if !ctx.openai_key_available {
-                    return Some(
-                        "OpenAI is selected but OPENAI_API_KEY is not available".to_string(),
-                    );
-                }
+                return Some(
+                    "this meeting used the removed OpenAI provider; retranscribe with voxtype or whisper_cpp".to_string(),
+                );
             }
             ProviderKind::WhisperCpp => {
                 let executable = &ctx.config.transcription.whisper_cpp.executable;
@@ -242,7 +238,7 @@ mod tests {
             id: "j".into(),
             audio_chunk_id: "c1".into(),
             run_id: "r".into(),
-            provider: ProviderKind::Openai,
+            provider: ProviderKind::Voxtype,
             model: Some("m".into()),
             state,
             attempt_count: 1,
@@ -258,7 +254,6 @@ mod tests {
         StatusContext {
             config,
             now: Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap(),
-            openai_key_available: true,
         }
     }
 

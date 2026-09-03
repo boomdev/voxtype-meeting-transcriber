@@ -96,7 +96,7 @@ async fn ui_ipc_state_start_stop_list_config_events() {
     let events = extras.events.clone();
     let socket = bind_or_fail(&paths).await.unwrap();
     let status = Arc::new(Mutex::new(RuntimeStatus::new(
-        voxtype_meeting_service::config::ProviderKind::Openai,
+        voxtype_meeting_service::config::ProviderKind::Voxtype,
     )));
     let shutdown = CancellationToken::new();
     let server = {
@@ -114,7 +114,7 @@ async fn ui_ipc_state_start_stop_list_config_events() {
     assert_eq!(state["recording"]["active"], false);
     assert!(state["panel"]["state"].is_string());
     assert_eq!(state["recent_sessions"][0]["title"], "Meeting with Paul");
-    assert!(state["openai_api_key_available"].is_boolean());
+    assert!(state["panel"]["pending_jobs"].is_number());
 
     let started = parse_ok(&sock, serde_json::json!({"op": "start_recording"})).await;
     assert_eq!(started["session_id"], "sess-started");
@@ -131,7 +131,7 @@ async fn ui_ipc_state_start_stop_list_config_events() {
     let cfg = parse_ok(&sock, serde_json::json!({"op": "get_config"})).await;
     assert!(cfg["config"]["transcript"]["omit_single_source_headers"].is_boolean());
     assert!(cfg["config"]["transcription"]["languages"].is_array());
-    assert!(cfg.get("openai_api_key").is_none());
+    assert_eq!(cfg["config"]["transcription"]["provider"], "voxtype");
 
     let updated = parse_ok(
         &sock,

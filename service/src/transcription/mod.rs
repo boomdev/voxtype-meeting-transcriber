@@ -7,8 +7,8 @@ use crate::config::{Config, ProviderKind};
 use crate::error::Result;
 use crate::storage::types::AudioChunkRecord;
 
+pub mod bounded;
 pub mod fake;
-pub mod openai;
 pub mod retry;
 pub mod voxtype;
 pub mod whisper_cpp;
@@ -67,15 +67,9 @@ pub fn provider_for_job(
         ProviderKind::Voxtype => Ok(Box::new(voxtype::VoxtypeProvider::new(
             model.unwrap_or(&config.transcription.model).to_string(),
         ))),
-        ProviderKind::Openai => {
-            let model = model
-                .filter(|value| !value.is_empty())
-                .unwrap_or(config.transcription.model.as_str());
-            Ok(Box::new(openai::OpenAIProvider::from_model_and_languages(
-                model,
-                config.transcription.languages.clone(),
-            )?))
-        }
+        ProviderKind::Openai => Err(crate::error::AppError::transcription(
+            "the OpenAI remote provider has been removed; use voxtype or whisper_cpp",
+        )),
         ProviderKind::WhisperCpp => {
             let model_path = model
                 .filter(|value| !value.is_empty())
@@ -97,14 +91,23 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn factory_builds_both_kinds() {
+    fn factory_builds_local_kinds() {
         let config =
             parse_toml_with_home(crate::config::DEFAULT_CONFIG_TOML, Path::new("/home/xa"))
                 .unwrap();
-        let openai = provider_from_kind(ProviderKind::Openai, &config).unwrap();
-        assert_eq!(openai.name(), ProviderKind::Openai);
+        let voxtype = provider_from_kind(ProviderKind::Voxtype, &config).unwrap();
+        assert_eq!(voxtype.name(), ProviderKind::Voxtype);
         let whisper = provider_from_kind(ProviderKind::WhisperCpp, &config).unwrap();
         assert_eq!(whisper.name(), ProviderKind::WhisperCpp);
+        match provider_from_kind(ProviderKind::Openai, &config) {
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("OpenAI remote provider has been removed"),
+                "{error}"
+            ),
+            Ok(_) => panic!("OpenAI provider should be unavailable"),
+        }
     }
 
     #[test]
@@ -112,8 +115,8 @@ mod tests {
         let config = parse_toml_with_home(
             r#"
 [transcription]
-provider = "openai"
-model = "gpt-transcribe"
+provider = "voxtype"
+model = "configured"
 languages = ["fr", "en"]
 "#,
             Path::new("/home/xa"),
