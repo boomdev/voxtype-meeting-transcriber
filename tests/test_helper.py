@@ -102,6 +102,18 @@ class HelperTests(unittest.TestCase):
             self.assertIn('language = "fr"', cfg.read_text(encoding="utf-8"))
             self.assertNotIn('language = "en"', cfg.read_text(encoding="utf-8"))
 
+    def test_set_voxtype_language_refuses_symlink_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "real.toml"
+            real.write_text('engine = "whisper"\n[whisper]\nmodel = "small"\nlanguage = "en"\n', encoding="utf-8")
+            link = Path(tmp) / "config.toml"
+            link.symlink_to(real)
+            with patch.object(helper, "voxtype_config_path", return_value=link):
+                result = helper.set_voxtype_language("fr")
+            self.assertFalse(result["ok"])
+            self.assertIn("Could not read Voxtype configuration", result["error"])
+            self.assertIn('language = "en"', real.read_text(encoding="utf-8"))
+
     def test_set_voxtype_language_rejects_english_only_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Path(tmp) / "config.toml"
@@ -267,5 +279,52 @@ class HelperTests(unittest.TestCase):
                 max_bytes=4096,
             )
         self.assertLess(time.monotonic() - start, 4)
+
+    def test_language_write_does_not_leave_predictable_tmp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.toml"
+            cfg.write_text('engine = "whisper"\n[whisper]\nmodel = "small"\nlanguage = "en"\n', encoding="utf-8")
+            with patch.object(helper, "voxtype_config_path", return_value=cfg):
+                with patch.object(helper, "restart_voxtype_daemon", return_value={"ok": True}):
+                    result = helper.set_voxtype_language("fr")
+            self.assertTrue(result["ok"])
+            self.assertFalse((Path(tmp) / "config.toml.tmp").exists())
+            leftovers = list(Path(tmp).glob(".config.toml.*.tmp"))
+            self.assertEqual(leftovers, [])
+
+    def test_read_private_file_refuses_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real.toml"
+            real.write_text("engine = 'whisper'\n", encoding="utf-8")
+            link = root / "config.toml"
+            link.symlink_to(real)
+            with self.assertRaises(OSError):
+                helper.read_private_file(link, max_bytes=4096)
+
+    def test_copy_private_file_refuses_symlink_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real.md"
+            real.write_text("secret", encoding="utf-8")
+            link = root / "transcript.md"
+            link.symlink_to(real)
+            dest = root / "out.md"
+            with self.assertRaises(OSError):
+                helper.copy_private_file(link, dest, max_bytes=4096)
+            self.assertFalse(dest.exists())
+            self.assertEqual(real.read_text(encoding="utf-8"), "secret")
+
+    def test_copy_private_file_skips_existing_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "transcript.md"
+            source.write_text("notes", encoding="utf-8")
+            dest = root / "meeting.md"
+            dest.write_text("old", encoding="utf-8")
+            written = helper.copy_private_file(source, dest, max_bytes=4096)
+            self.assertEqual(written.name, "meeting-2.md")
+            self.assertEqual(dest.read_text(encoding="utf-8"), "old")
+            self.assertEqual(written.read_text(encoding="utf-8"), "notes")
 
 if __name__ == "__main__": unittest.main()

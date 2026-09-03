@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import errno
 import fcntl
 import json
 import os
 from pathlib import Path
+import secrets
 import select
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -25,6 +29,15 @@ SUBPROCESS_MAX_BYTES = 64 * 1024
 SUBPROCESS_KILL_GRACE_SECS = 2
 VOXTYPE_STATUS_TIMEOUT_SECS = 3
 VOXTYPE_RESTART_TIMEOUT_SECS = 45
+CONFIG_MAX_BYTES = 1024 * 1024
+SIDECAR_MAX_BYTES = 64 * 1024
+TRANSCRIPT_MAX_BYTES = 32 * 1024 * 1024
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NONBLOCK
+_DIR_NOFOLLOW_FLAGS = _DIR_FLAGS | os.O_NOFOLLOW
+_FILE_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+_FILE_WRITE_FLAGS = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+)
 
 # Matches Voxtype's Engine → Whisper · language TUI cycle list (src/tui/engine.rs LANG_CHOICES).
 VOXTYPE_WHISPER_LANGUAGES = [
@@ -239,6 +252,250 @@ def request(payload: dict) -> dict:
     except (OSError, ValueError, TimeoutError) as exc:
         return {"ok": False, "error": f"Could not contact the meeting service: {exc}"}
 
+
+def _leaf_name(path: Path) -> str:
+    name = Path(path).name
+    if not name or name in (".", "..") or "/" in name or "\x00" in name:
+        raise OSError("invalid file name")
+    return name
+
+
+def _absolute_parts(path: Path) -> list[str]:
+    expanded = Path(os.path.expandvars(os.path.expanduser(str(path))))
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    parts = []
+    for part in expanded.parts:
+        if part in ("/", "", "."):
+            continue
+        if part == "..":
+            raise OSError("path traversal is not allowed")
+        if "/" in part or "\x00" in part:
+            raise OSError("invalid path component")
+        parts.append(part)
+    return parts
+
+
+def _assert_dir(st: os.stat_result, *, final: bool) -> None:
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(errno.ENOTDIR, "not a directory")
+    euid = os.geteuid()
+    if final:
+        if st.st_uid != euid:
+            raise OSError(errno.EPERM, "directory is not owned by the current user")
+        if st.st_mode & 0o002:
+            raise OSError(errno.EPERM, "directory is world-writable")
+        return
+    if st.st_uid not in (0, euid):
+        raise OSError(errno.EPERM, "untrusted directory in path")
+
+
+def _assert_owned_regular_file(st: os.stat_result, max_bytes: int) -> None:
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(errno.EPERM, "not a regular file")
+    if st.st_uid != os.geteuid():
+        raise OSError(errno.EPERM, "file is not owned by the current user")
+    if st.st_mode & 0o002:
+        raise OSError(errno.EPERM, "file is world-writable")
+    if st.st_size > max_bytes:
+        raise OSError("file exceeds size limit")
+
+
+def _open_dir_component(dirfd: int, name: str, *, create: bool, final: bool) -> int:
+    try:
+        fd = os.open(name, _DIR_NOFOLLOW_FLAGS, dir_fd=dirfd)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(name, 0o700, dir_fd=dirfd)
+        except FileExistsError:
+            pass
+        fd = os.open(name, _DIR_NOFOLLOW_FLAGS, dir_fd=dirfd)
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            raise
+        lst = os.lstat(name, dir_fd=dirfd)
+        if not stat.S_ISLNK(lst.st_mode) or lst.st_uid not in (0, os.geteuid()):
+            raise OSError(exc.errno, "refusing to follow symbolic link") from exc
+        fd = os.open(name, _DIR_FLAGS, dir_fd=dirfd)
+    try:
+        _assert_dir(os.fstat(fd), final=final)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_held_dir(path: Path, *, create: bool) -> int:
+    parts = _absolute_parts(path)
+    fd = os.open("/", _DIR_FLAGS)
+    try:
+        for index, part in enumerate(parts):
+            next_fd = _open_dir_component(fd, part, create=create, final=index == len(parts) - 1)
+            os.close(fd)
+            fd = next_fd
+        if not parts:
+            _assert_dir(os.fstat(fd), final=True)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+@contextlib.contextmanager
+def held_directory(path: Path, *, create: bool = False):
+    fd = _open_held_dir(Path(path), create=create)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _read_fd(fd: int, max_bytes: int) -> bytes:
+    data = bytearray()
+    while True:
+        chunk = os.read(fd, min(65536, max(1, max_bytes - len(data) + 1)))
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > max_bytes:
+            raise OSError("file exceeds size limit")
+    return bytes(data)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+def _copy_fd(src_fd: int, dst_fd: int, max_bytes: int) -> None:
+    copied = 0
+    while True:
+        chunk = os.read(src_fd, 65536)
+        if not chunk:
+            break
+        copied += len(chunk)
+        if copied > max_bytes:
+            raise OSError("file exceeds size limit")
+        _write_all(dst_fd, chunk)
+
+
+def _exclusive_tmp(dirfd: int, prefix: str) -> tuple[int, str]:
+    for _ in range(16):
+        name = f".{prefix}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(name, _FILE_WRITE_FLAGS, 0o600, dir_fd=dirfd)
+        except FileExistsError:
+            continue
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            os.close(fd)
+            try:
+                os.unlink(name, dir_fd=dirfd)
+            except OSError:
+                pass
+            raise
+        return fd, name
+    raise OSError("could not create a private temporary file")
+
+
+def read_private_file(path: Path, *, max_bytes: int) -> bytes:
+    path = Path(path)
+    with held_directory(path.parent, create=False) as dirfd:
+        fd = os.open(_leaf_name(path), _FILE_READ_FLAGS, dir_fd=dirfd)
+        try:
+            _assert_owned_regular_file(os.fstat(fd), max_bytes)
+            return _read_fd(fd, max_bytes)
+        finally:
+            os.close(fd)
+
+
+def write_private_file(path: Path, data: bytes, *, max_bytes: int, create_dir: bool = False) -> None:
+    if len(data) > max_bytes:
+        raise OSError("payload exceeds size limit")
+    path = Path(path)
+    name = _leaf_name(path)
+    with held_directory(path.parent, create=create_dir) as dirfd:
+        fd, tmp_name = _exclusive_tmp(dirfd, name)
+        try:
+            try:
+                _write_all(fd, data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(tmp_name, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+            os.fsync(dirfd)
+        except Exception:
+            try:
+                os.unlink(tmp_name, dir_fd=dirfd)
+            except OSError:
+                pass
+            raise
+
+
+def copy_private_file(source: Path, dest: Path, *, max_bytes: int) -> Path:
+    source = Path(source)
+    dest = Path(dest)
+    with held_directory(source.parent, create=False) as src_dir:
+        src_fd = os.open(_leaf_name(source), _FILE_READ_FLAGS, dir_fd=src_dir)
+        try:
+            _assert_owned_regular_file(os.fstat(src_fd), max_bytes)
+            with held_directory(dest.parent, create=True) as dst_dir:
+                tmp_fd, tmp_name = _exclusive_tmp(dst_dir, _leaf_name(dest))
+                try:
+                    try:
+                        _copy_fd(src_fd, tmp_fd, max_bytes)
+                        os.fsync(tmp_fd)
+                    finally:
+                        os.close(tmp_fd)
+                    dest_name = _publish_exclusive(dst_dir, tmp_name, dest)
+                    return dest.parent / dest_name
+                except Exception:
+                    try:
+                        os.unlink(tmp_name, dir_fd=dst_dir)
+                    except OSError:
+                        pass
+                    raise
+        finally:
+            os.close(src_fd)
+
+
+def _publish_exclusive(dirfd: int, tmp_name: str, dest: Path) -> str:
+    stem, suffix = dest.stem, dest.suffix
+    candidates = [_leaf_name(dest)]
+    for index in range(2, 1000):
+        candidates.append(_leaf_name(Path(f"{stem}-{index}{suffix}")))
+    for name in candidates:
+        try:
+            os.link(tmp_name, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
+        except FileExistsError:
+            continue
+        os.unlink(tmp_name, dir_fd=dirfd)
+        os.fsync(dirfd)
+        return name
+    raise OSError("could not choose an exclusive destination name")
+
+
+def owned_regular_file(path: Path, *, max_bytes: int) -> bool:
+    try:
+        path = Path(path)
+        with held_directory(path.parent, create=False) as dirfd:
+            fd = os.open(_leaf_name(path), _FILE_READ_FLAGS, dir_fd=dirfd)
+            try:
+                _assert_owned_regular_file(os.fstat(fd), max_bytes)
+            finally:
+                os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
 def voxtype_config_path() -> Path:
     return Path.home() / ".config/voxtype/config.toml"
 
@@ -252,14 +509,14 @@ def normalize_language_code(value) -> str:
 
 def voxtype_summary() -> tuple[str, str, str]:
     try:
-        with voxtype_config_path().open("rb") as handle:
-            cfg = tomllib.load(handle)
+        raw = read_private_file(voxtype_config_path(), max_bytes=CONFIG_MAX_BYTES)
+        cfg = tomllib.loads(raw.decode("utf-8"))
         engine = str(cfg.get("engine") or "whisper")
         section = cfg.get(engine) if isinstance(cfg.get(engine), dict) else cfg.get("whisper", {})
         section = section or {}
         model = str(section.get("model") or "configured")
         return engine, model, normalize_language_code(section.get("language", "en"))
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return "voxtype", "configured", "en"
 
 def language_option(code: str) -> dict:
@@ -415,10 +672,12 @@ def set_voxtype_language(code: str) -> dict:
     language = normalize_language_code(code)
     path = voxtype_config_path()
     try:
-        contents = path.read_text(encoding="utf-8")
+        contents = read_private_file(path, max_bytes=CONFIG_MAX_BYTES).decode("utf-8")
     except FileNotFoundError:
         return {"ok": False, "error": "Voxtype configuration was not found."}
     except OSError as exc:
+        return {"ok": False, "error": f"Could not read Voxtype configuration: {exc}"}
+    except UnicodeDecodeError as exc:
         return {"ok": False, "error": f"Could not read Voxtype configuration: {exc}"}
     engine, model, current = voxtype_summary()
     name = Path(model or "").name.lower()
@@ -428,10 +687,8 @@ def set_voxtype_language(code: str) -> dict:
     if language not in allowed:
         return {"ok": False, "error": f"Language '{language}' is not available for the current Voxtype engine."}
     updated = apply_language_override(contents, engine, language)
-    tmp = path.with_name(path.name + ".tmp")
     try:
-        tmp.write_text(updated, encoding="utf-8")
-        tmp.replace(path)
+        write_private_file(path, updated.encode("utf-8"), max_bytes=CONFIG_MAX_BYTES)
     except OSError as exc:
         return {"ok": False, "error": f"Could not update Voxtype language: {exc}"}
     _, _, after = voxtype_summary()
@@ -455,18 +712,20 @@ def read_exported_path(session_dir: str) -> str:
         return ""
     sidecar = export_sidecar_path(session_dir)
     try:
-        payload = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        payload = json.loads(read_private_file(sidecar, max_bytes=SIDECAR_MAX_BYTES).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
         return ""
     path = str(payload.get("path") or "").strip()
-    return path if path and Path(path).is_file() else ""
+    if not path:
+        return ""
+    return path if owned_regular_file(Path(path), max_bytes=TRANSCRIPT_MAX_BYTES) else ""
 
 def write_exported_path(session_dir: str, path: Path) -> None:
     if not session_dir:
         return
     sidecar = export_sidecar_path(session_dir)
-    sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(json.dumps({"path": str(path)}, ensure_ascii=False), encoding="utf-8")
+    payload = json.dumps({"path": str(path)}, ensure_ascii=False).encode("utf-8")
+    write_private_file(sidecar, payload, max_bytes=SIDECAR_MAX_BYTES, create_dir=False)
 
 def normalize_session(item: dict) -> dict:
     session_dir = str(item.get("session_dir") or "")
@@ -558,7 +817,7 @@ def find_session(meeting_id: str) -> dict:
     return {"ok": True, "session": selected}
 
 def open_path(path: Path) -> dict | None:
-    if not path.is_file():
+    if not owned_regular_file(path, max_bytes=TRANSCRIPT_MAX_BYTES):
         return {"ok": False, "error": "The exported transcript is no longer on disk.", "path": str(path)}
     opener = shutil.which("omarchy-launch-editor") or shutil.which("xdg-open")
     if not opener:
@@ -579,17 +838,21 @@ def export_meeting(meeting_id: str, directory: str, open_after: bool) -> dict:
     if not found.get("ok"): return found
     selected = found["session"]
     source = Path(str(selected.get("transcript_md") or ""))
-    if not source.is_file(): return {"ok": False, "error": "The transcript is still being prepared."}
-    target_dir = home_path(directory); target_dir.mkdir(parents=True, exist_ok=True)
+    if not source.name:
+        return {"ok": False, "error": "The transcript is still being prepared."}
+    target_dir = home_path(directory)
     target = target_dir / safe_name(str(selected.get("title") or "Meeting"), str(selected.get("started_at") or ""))
-    suffix = 2
-    while target.exists(): target = target.with_name(f"{target.stem}-{suffix}{target.suffix}"); suffix += 1
-    shutil.copy2(source, target)
-    write_exported_path(str(selected.get("session_dir") or ""), target)
+    try:
+        written = copy_private_file(source, target, max_bytes=TRANSCRIPT_MAX_BYTES)
+    except FileNotFoundError:
+        return {"ok": False, "error": "The transcript is still being prepared."}
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not export the transcript: {exc}"}
+    write_exported_path(str(selected.get("session_dir") or ""), written)
     if open_after:
-        failed = open_path(target)
+        failed = open_path(written)
         if failed: return {**failed, "message": "Transcript exported"}
-    return {"ok": True, "message": "Transcript exported", "path": str(target), "meetingId": selected.get("id")}
+    return {"ok": True, "message": "Transcript exported", "path": str(written), "meetingId": selected.get("id")}
 
 def open_meeting(meeting_id: str) -> dict:
     found = find_session(meeting_id)
@@ -631,7 +894,11 @@ def folder_opener_command(path: Path) -> list[str] | None:
 
 def open_export_folder(directory: str) -> dict:
     target = home_path(directory)
-    target.mkdir(parents=True, exist_ok=True)
+    try:
+        with held_directory(target, create=True):
+            pass
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not open the folder: {exc}", "path": str(target)}
     failed = open_directory(target)
     if failed:
         return failed
