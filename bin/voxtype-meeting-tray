@@ -16,6 +16,8 @@ import tomllib
 
 APP = "Voxtype Meeting Transcriber"
 EXPORT_SIDECAR = "export.json"
+CONTROL_IDLE_TIMEOUT_SECS = 30
+CONTROL_MAX_LINE_BYTES = 64 * 1024
 
 # Matches Voxtype's Engine → Whisper · language TUI cycle list (src/tui/engine.rs LANG_CHOICES).
 VOXTYPE_WHISPER_LANGUAGES = [
@@ -47,22 +49,48 @@ def runtime_socket() -> Path:
     root = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     return Path(root) / "voxtype-meeting-service" / "voxtype-meeting-service.sock"
 
+def _set_deadline_timeout(client: socket.socket, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("control socket deadline exceeded")
+    client.settimeout(remaining)
+
+
 def request(payload: dict) -> dict:
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "error": f"Could not contact the meeting service: {exc}"}
+    if len(encoded) > CONTROL_MAX_LINE_BYTES:
+        return {"ok": False, "error": "Control request exceeds protocol maximum."}
     path = runtime_socket()
     if not path.exists():
         return {"ok": False, "error": "Voxtype Meeting Service is not running."}
     try:
+        deadline = time.monotonic() + CONTROL_IDLE_TIMEOUT_SECS
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(35)
+            _set_deadline_timeout(client, deadline)
             client.connect(str(path))
-            client.sendall(json.dumps(payload).encode() + b"\n")
-            data = b""
-            while b"\n" not in data:
-                block = client.recv(65536)
-                if not block: break
-                data += block
-        return json.loads(data.splitlines()[0])
-    except (OSError, ValueError, IndexError) as exc:
+            _set_deadline_timeout(client, deadline)
+            client.sendall(encoded + b"\n")
+            data = bytearray()
+            while True:
+                _set_deadline_timeout(client, deadline)
+                room = CONTROL_MAX_LINE_BYTES - len(data)
+                block = client.recv(min(4096, room + 1))
+                if not block:
+                    break
+                newline = block.find(b"\n")
+                if newline != -1:
+                    if len(data) + newline > CONTROL_MAX_LINE_BYTES:
+                        return {"ok": False, "error": "Control response exceeds protocol maximum."}
+                    data.extend(block[:newline])
+                    break
+                if len(data) + len(block) > CONTROL_MAX_LINE_BYTES:
+                    return {"ok": False, "error": "Control response exceeds protocol maximum."}
+                data.extend(block)
+        return json.loads(bytes(data))
+    except (OSError, ValueError, TimeoutError) as exc:
         return {"ok": False, "error": f"Could not contact the meeting service: {exc}"}
 
 def voxtype_config_path() -> Path:

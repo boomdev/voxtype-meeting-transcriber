@@ -3,7 +3,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 loader = importlib.machinery.SourceFileLoader("helper", str(ROOT / "bin/voxtype-meeting-tray"))
@@ -186,5 +186,47 @@ class HelperTests(unittest.TestCase):
                     result = helper.open_export_folder(str(folder))
             self.assertTrue(result["ok"])
             self.assertEqual(popen.call_args.args[0], ["/usr/bin/xdg-open", str(folder)])
+
+    def test_request_rejects_oversized_payload(self):
+        result = helper.request({"op": "x" * (helper.CONTROL_MAX_LINE_BYTES + 1)})
+        self.assertFalse(result["ok"])
+        self.assertIn("protocol maximum", result["error"])
+
+    def test_request_rejects_oversized_response_while_streaming(self):
+        class FakeSocket:
+            def __init__(self):
+                self.timeouts = []
+                self._chunks = [b"x" * 4096] * 20
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def connect(self, _path):
+                return None
+
+            def sendall(self, _data):
+                return None
+
+            def recv(self, size):
+                if not self._chunks:
+                    return b""
+                return self._chunks.pop(0)[:size]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        fake_path = Mock()
+        fake_path.exists.return_value = True
+        sock = FakeSocket()
+        with patch.object(helper, "runtime_socket", return_value=fake_path):
+            with patch.object(helper.socket, "socket", return_value=sock):
+                result = helper.request({"op": "status"})
+        self.assertFalse(result["ok"])
+        self.assertIn("protocol maximum", result["error"])
+        self.assertTrue(sock.timeouts)
+        self.assertLessEqual(max(sock.timeouts), helper.CONTROL_IDLE_TIMEOUT_SECS)
 
 if __name__ == "__main__": unittest.main()

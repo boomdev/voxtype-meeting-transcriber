@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::AudioBackend;
@@ -13,6 +14,7 @@ use crate::error::{AppError, Result};
 use crate::paths::{self, PathResolver};
 use crate::runtime::{
     lock_status, AudioServerHealth, EventBus, SharedStatus, CONTROL_IDLE_TIMEOUT_SECS,
+    CONTROL_MAX_LINE_BYTES,
 };
 use crate::storage::Db;
 
@@ -110,16 +112,19 @@ async fn handle_client(
     shutdown: CancellationToken,
     extras: Option<ControlExtras>,
 ) {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    let read = tokio::time::timeout(
-        Duration::from_secs(CONTROL_IDLE_TIMEOUT_SECS),
-        lines.next_line(),
-    )
-    .await;
-    let line = match read {
-        Ok(Ok(Some(line))) => line,
-        _ => return,
+    let deadline = Instant::now() + Duration::from_secs(CONTROL_IDLE_TIMEOUT_SECS);
+    let (mut reader, mut writer) = stream.into_split();
+    let line = match read_limited_line(&mut reader, CONTROL_MAX_LINE_BYTES, deadline).await {
+        Ok(line) => line,
+        Err(LineReadError::TooLong) => {
+            let mut payload = encode_response(&Response::error(
+                "control message exceeds protocol maximum",
+            ));
+            payload.push('\n');
+            let _ = timeout_at(deadline, writer.write_all(payload.as_bytes())).await;
+            return;
+        }
+        Err(_) => return,
     };
     let request = match parse_request(line.trim()) {
         Err(error) => {
@@ -271,36 +276,101 @@ pub async fn send_request(path: &Path, op: &str) -> Result<Response> {
 }
 
 pub async fn send_json(path: &Path, body: &serde_json::Value) -> Result<String> {
-    let stream = UnixStream::connect(path).await.map_err(|error| {
-        AppError::control(format!(
-            "could not connect to control socket {}: {error}",
-            path.display()
-        ))
-    })?;
-    let (reader, mut writer) = stream.into_split();
+    let deadline = Instant::now() + Duration::from_secs(CONTROL_IDLE_TIMEOUT_SECS);
+    let stream = timeout_at(deadline, UnixStream::connect(path))
+        .await
+        .map_err(|_| AppError::control("timed out connecting to control socket"))?
+        .map_err(|error| {
+            AppError::control(format!(
+                "could not connect to control socket {}: {error}",
+                path.display()
+            ))
+        })?;
+    let (mut reader, mut writer) = stream.into_split();
     let mut payload = serde_json::to_string(body)?;
+    if payload.len() > CONTROL_MAX_LINE_BYTES {
+        return Err(AppError::control(
+            "control message exceeds protocol maximum",
+        ));
+    }
     payload.push('\n');
-    writer.write_all(payload.as_bytes()).await?;
-    writer.shutdown().await?;
-    let mut lines = BufReader::new(reader).lines();
-    tokio::time::timeout(
-        Duration::from_secs(CONTROL_IDLE_TIMEOUT_SECS),
-        lines.next_line(),
-    )
-    .await
-    .map_err(|_| AppError::control("timed out waiting for control socket response"))?
-    .map_err(|error| AppError::control(format!("control socket read failed: {error}")))?
-    .ok_or_else(|| AppError::control("control socket closed without a response"))
+    timeout_at(deadline, writer.write_all(payload.as_bytes()))
+        .await
+        .map_err(|_| AppError::control("timed out writing control socket request"))?
+        .map_err(|error| AppError::control(format!("control socket write failed: {error}")))?;
+    timeout_at(deadline, writer.shutdown())
+        .await
+        .map_err(|_| AppError::control("timed out closing control socket write"))?
+        .map_err(|error| AppError::control(format!("control socket shutdown failed: {error}")))?;
+    read_limited_line(&mut reader, CONTROL_MAX_LINE_BYTES, deadline)
+        .await
+        .map_err(LineReadError::into_control)
+}
+
+#[derive(Debug)]
+enum LineReadError {
+    Timeout,
+    Closed,
+    TooLong,
+    InvalidUtf8,
+    Io(std::io::Error),
+}
+
+impl LineReadError {
+    fn into_control(self) -> AppError {
+        match self {
+            Self::Timeout => AppError::control("timed out waiting for control socket response"),
+            Self::Closed => AppError::control("control socket closed without a response"),
+            Self::TooLong => AppError::control("control message exceeds protocol maximum"),
+            Self::InvalidUtf8 => AppError::control("control message is not valid UTF-8"),
+            Self::Io(error) => AppError::control(format!("control socket read failed: {error}")),
+        }
+    }
+}
+
+async fn read_limited_line<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+    deadline: Instant,
+) -> std::result::Result<String, LineReadError> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(LineReadError::Timeout);
+        }
+        let n = match timeout_at(deadline, reader.read(&mut chunk)).await {
+            Err(_) => return Err(LineReadError::Timeout),
+            Ok(Err(error)) => return Err(LineReadError::Io(error)),
+            Ok(Ok(0)) => return Err(LineReadError::Closed),
+            Ok(Ok(n)) => n,
+        };
+        let bytes = &chunk[..n];
+        if let Some(pos) = bytes.iter().position(|&b| b == b'\n') {
+            if buf.len().saturating_add(pos) > max_bytes {
+                return Err(LineReadError::TooLong);
+            }
+            buf.extend_from_slice(&bytes[..pos]);
+            return String::from_utf8(buf).map_err(|_| LineReadError::InvalidUtf8);
+        }
+        if buf.len().saturating_add(bytes.len()) > max_bytes {
+            return Err(LineReadError::TooLong);
+        }
+        buf.extend_from_slice(bytes);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_or_fail, serve};
+    use super::{bind_or_fail, read_limited_line, serve, LineReadError};
     use crate::config::ProviderKind;
     use crate::paths::PathResolver;
-    use crate::runtime::RuntimeStatus;
+    use crate::runtime::{RuntimeStatus, CONTROL_MAX_LINE_BYTES};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
     fn test_paths(root: &std::path::Path) -> PathResolver {
@@ -364,5 +434,78 @@ mod tests {
             Ok(_) => panic!("second bind should fail while the first socket is live"),
         };
         assert!(err.to_string().contains("already running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn limited_line_accepts_payload_at_cap() {
+        let (client, mut server) = tokio::io::duplex(128);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        tokio::spawn(async move {
+            let mut payload = vec![b'a'; 8];
+            payload.push(b'\n');
+            server.write_all(&payload).await.unwrap();
+        });
+        let mut reader = client;
+        let line = read_limited_line(&mut reader, 8, deadline).await.unwrap();
+        assert_eq!(line.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn limited_line_rejects_overflow_while_streaming() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        tokio::spawn(async move {
+            server.write_all(&vec![b'x'; 64]).await.unwrap();
+        });
+        let mut reader = client;
+        let error = read_limited_line(&mut reader, 16, deadline)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LineReadError::TooLong));
+    }
+
+    #[tokio::test]
+    async fn limited_line_uses_total_deadline() {
+        let (client, _server) = tokio::io::duplex(64);
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let mut reader = client;
+        let error = read_limited_line(&mut reader, 16, deadline)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LineReadError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        crate::paths::ensure_dir(&paths.data_dir()).unwrap();
+        let db = crate::storage::Db::open(paths.db_path()).unwrap();
+        drop(db);
+        let socket = bind_or_fail(&paths).await.unwrap();
+        let status = Arc::new(Mutex::new(RuntimeStatus::new(ProviderKind::Openai)));
+        let shutdown = CancellationToken::new();
+        let server = {
+            let paths = paths.clone();
+            let db_path = paths.db_path();
+            let status = status.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move { serve(socket, paths, db_path, status, shutdown, None).await })
+        };
+        let path = paths.control_socket().unwrap();
+        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        stream
+            .write_all(&vec![b'x'; CONTROL_MAX_LINE_BYTES + 1])
+            .await
+            .unwrap();
+        stream.write_all(b"\n").await.ok();
+        let mut reply = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut reply).await;
+        server.abort();
+        let text = String::from_utf8_lossy(&reply);
+        assert!(
+            text.contains("protocol maximum"),
+            "unexpected reply: {text}"
+        );
     }
 }
