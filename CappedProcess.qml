@@ -37,13 +37,17 @@ Process {
   }
 
   property Timer deadlineTimer: Timer {
-    interval: Math.max(100, root.timeoutSec * 1000)
+    // Let the timeout supervisor enforce the deadline first. This timer is a
+    // UI-side watchdog in case the wrapper itself stops making progress.
+    interval: Math.max(100, root.timeoutSec * 1000 + 250)
     repeat: false
     onTriggered: root.abort("timeout")
   }
 
   property Timer killTimer: Timer {
-    interval: Math.max(100, root.killAfterMs)
+    // GNU timeout owns descendant cleanup. Only kill the wrapper after its
+    // --kill-after grace period has had time to terminate and reap the group.
+    interval: Math.max(100, root.killAfterMs + 500)
     repeat: false
     onTriggered: {
       if (root.running)
@@ -73,7 +77,7 @@ Process {
   }
 
   function _checkCap() {
-    if (root._byteSize(stdoutCap) > root.maxBytes || root._byteSize(stderrCap) > root.maxBytes)
+    if (root._byteSize(stdoutCap) + root._byteSize(stderrCap) > root.maxBytes)
       root.abort("overflow")
   }
 
@@ -85,7 +89,11 @@ Process {
     deadlineTimer.stop()
     if (!root.running)
       return
-    root.running = false
+    // The direct child is GNU timeout, which forwards TERM to the process
+    // group it created and applies --kill-after to resistant descendants.
+    // Setting running=false would terminate only the wrapper and could orphan
+    // the producer that caused the timeout or overflow.
+    root.signal(15)
     killTimer.restart()
   }
 }

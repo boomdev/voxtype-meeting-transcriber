@@ -114,7 +114,7 @@ Transcription is local only. The capture service runs Voxtype or whisper.cpp on 
 
 ```bash
 omarchy plugin validate .
-qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml Backend.qml IconButton.qml
+qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml Backend.qml CappedProcess.qml IconButton.qml
 ```
 
 ## License

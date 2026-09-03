@@ -286,8 +286,12 @@ def _assert_dir(st: os.stat_result, *, final: bool) -> None:
         if st.st_mode & 0o002:
             raise OSError(errno.EPERM, "directory is world-writable")
         return
-    if st.st_uid not in (0, euid):
-        raise OSError(errno.EPERM, "untrusted directory in path")
+    # Intermediate components are only traversal anchors.  They may
+    # legitimately be owned by another uid (for example /home on a managed
+    # system, a mounted export location, or the sandbox's /tmp).  Opening each
+    # component with O_NOFOLLOW and retaining its descriptor prevents a rename
+    # or symlink swap from changing the directory we subsequently operate in;
+    # ownership is required only for the final directory and file.
 
 
 def _assert_owned_regular_file(st: os.stat_result, max_bytes: int) -> None:

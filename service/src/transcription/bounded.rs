@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
-use tokio::time::timeout;
+use tokio::time::{sleep_until, timeout, Instant};
 
 use crate::error::{AppError, Result};
 
@@ -119,53 +119,69 @@ pub async fn run_capped_command(mut command: Command, limit: Duration) -> Result
     let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
+    let mut stdout_task = tokio::spawn(async move {
         match stdout {
             Some(reader) => read_capped(reader, PROCESS_OUTPUT_MAX_BYTES).await,
             None => Ok(ReadOutcome::Bytes(Vec::new())),
         }
     });
-    let stderr_task = tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         match stderr {
             Some(reader) => read_capped(reader, PROCESS_OUTPUT_MAX_BYTES).await,
             None => Ok(ReadOutcome::Bytes(Vec::new())),
         }
     });
-    match timeout(limit, child.wait()).await {
-        Err(_) => {
-            reap_group(&mut child, pid).await;
-            stdout_task.abort();
-            stderr_task.abort();
-            Err(AppError::transcription(
-                "transcription process timed out".to_string(),
-            ))
-        }
-        Ok(Err(error)) => {
-            reap_group(&mut child, pid).await;
-            stdout_task.abort();
-            stderr_task.abort();
-            Err(AppError::transcription(format!(
-                "transcription process failed: {error}"
-            )))
-        }
-        Ok(Ok(status)) => {
-            let stdout = join_output(stdout_task, &mut child, pid).await?;
-            let stderr = join_output(stderr_task, &mut child, pid).await?;
-            Ok(CappedOutput {
-                status,
-                stdout,
-                stderr,
-            })
+    let deadline = Instant::now() + limit;
+    let mut stdout = None;
+    let mut stderr = None;
+    let mut status = None;
+
+    while status.is_none() || stdout.is_none() || stderr.is_none() {
+        tokio::select! {
+            result = &mut stdout_task, if stdout.is_none() => {
+                stdout = Some(handle_reader_result(result, &mut child, pid).await?);
+            }
+            result = &mut stderr_task, if stderr.is_none() => {
+                stderr = Some(handle_reader_result(result, &mut child, pid).await?);
+            }
+            result = child.wait(), if status.is_none() => {
+                match result {
+                    Err(error) => {
+                        reap_group(&mut child, pid).await;
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        return Err(AppError::transcription(format!(
+                            "transcription process failed: {error}"
+                        )));
+                    }
+                    Ok(exit_status) => status = Some(exit_status),
+                }
+            }
+            _ = sleep_until(deadline) => {
+                reap_group(&mut child, pid).await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(AppError::transcription(if status.is_some() {
+                    "transcription process output did not close before the deadline".to_string()
+                } else {
+                    "transcription process timed out".to_string()
+                }));
+            }
         }
     }
+    Ok(CappedOutput {
+        status: status.expect("process status is present after collection loop"),
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
+    })
 }
 
-async fn join_output(
-    task: tokio::task::JoinHandle<std::io::Result<ReadOutcome>>,
+async fn handle_reader_result(
+    result: std::result::Result<std::io::Result<ReadOutcome>, tokio::task::JoinError>,
     child: &mut Child,
     pid: Option<u32>,
 ) -> Result<Vec<u8>> {
-    match task.await {
+    match result {
         Ok(Ok(ReadOutcome::Bytes(buf))) => Ok(buf),
         Ok(Ok(ReadOutcome::Overflow)) => {
             reap_group(child, pid).await;
@@ -268,12 +284,26 @@ mod tests {
 
     #[tokio::test]
     async fn capped_command_rejects_runaway_stdout() {
+        let started = std::time::Instant::now();
         let mut command = Command::new("sh");
         command.args(["-c", "dd if=/dev/zero bs=1024 count=8192 2>/dev/null"]);
         let error = run_capped_command(command, Duration::from_secs(5))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeds"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn capped_command_deadline_includes_descendant_held_pipes() {
+        let started = std::time::Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & exit 0"]);
+        let error = run_capped_command(command, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[tokio::test]
