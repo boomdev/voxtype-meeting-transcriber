@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 BarWidget {
@@ -14,8 +15,8 @@ BarWidget {
   readonly property bool hasError: panel ? panel.hasError === true : false
   readonly property string statusGlyph: panel ? String(panel.statusGlyph || "󰔊") : "󰔊"
   readonly property color statusColor: panel && panel.statusColor ? panel.statusColor
-    : (bar ? bar.foreground : Color.foreground)
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+    : (bar ? bar.foreground : Commons.Color.foreground)
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   // Shape contract for shell.summon/hide/toggle routing: Bar.findPanelWidget

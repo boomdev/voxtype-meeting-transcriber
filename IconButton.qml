@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Local copy of PanelActionButton that optically centers Nerd Font glyphs.
@@ -8,7 +9,7 @@ BorderSurface {
 
   property string iconText: ""
   property string tooltipText: ""
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property color hoverColor: foreground
   property string fontFamily: Style.font.family
   property real fontSize: Style.font.icon
@@ -33,10 +34,10 @@ BorderSurface {
 
   readonly property bool _showFocusRing: focusable && activeFocus
   readonly property bool _hot: (mouse.containsMouse || root.hasCursor) && root.enabled
-  readonly property color _selectedColor: Style.selectedStateColor(root.foreground, Color.accent)
-  readonly property var _selectedBorderSpec: Border.controlSpec("selected", foreground, Color.accent)
+  readonly property color _selectedColor: Style.selectedStateColor(root.foreground, Commons.Color.accent)
+  readonly property var _selectedBorderSpec: Border.controlSpec("selected", foreground, Commons.Color.accent)
   readonly property var _hoverBorderSpec: Border.controlSpec("hover-cursor", hoverColor, hoverColor)
-  readonly property var _normalBorderSpec: Border.controlSpec("normal", foreground, Color.accent)
+  readonly property var _normalBorderSpec: Border.controlSpec("normal", foreground, Commons.Color.accent)
   readonly property var _borderSpec: _showFocusRing
     ? Border.controlSpec("focus", hoverColor, hoverColor)
     : (_hot
@@ -50,7 +51,7 @@ BorderSurface {
     : (_hot
       ? Style.hoverFillFor(hoverColor, hoverColor)
       : (selected
-        ? Style.selectedFillFor(foreground, Color.accent)
+        ? Style.selectedFillFor(foreground, Commons.Color.accent)
         : "transparent"))
   borderSpec: _borderSpec
 
