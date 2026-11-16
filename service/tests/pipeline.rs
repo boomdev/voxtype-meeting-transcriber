@@ -7,7 +7,9 @@ use voxtype_meeting_service::audio::AudioSource;
 use voxtype_meeting_service::config::Config;
 use voxtype_meeting_service::paths::PathResolver;
 use voxtype_meeting_service::storage::chunks::list_chunks_for_session;
-use voxtype_meeting_service::storage::events::record_transcription_success;
+use voxtype_meeting_service::storage::events::{
+    claim_due_jobs, record_transcription_success, requeue_processing_job,
+};
 use voxtype_meeting_service::storage::jobs::{get_job, reset_processing_without_event};
 use voxtype_meeting_service::storage::sessions::insert_running_session;
 use voxtype_meeting_service::storage::types::JobState;
@@ -205,6 +207,64 @@ fn processing_job_recovers_to_pending() {
         })
         .unwrap();
     assert_eq!(pending, 1);
+}
+
+#[test]
+fn requeued_processing_job_becomes_claimable_again() {
+    let root = tempdir().unwrap();
+    let paths = test_paths(root.path());
+    let db = Db::open(paths.db_path()).unwrap();
+    let session_id = Uuid::new_v4().to_string();
+    db.with_conn(|conn| insert_running_session(conn, &session_id, None, None, None))
+        .unwrap();
+    let run = db
+        .with_conn(|conn| {
+            voxtype_meeting_service::storage::sessions::insert_run(
+                conn,
+                &session_id,
+                voxtype_meeting_service::config::ProviderKind::Voxtype,
+                "m",
+            )
+        })
+        .unwrap();
+    let mic_dir = paths.session_dir(&session_id).join("audio/mic");
+    voxtype_meeting_service::paths::ensure_dir(&mic_dir).unwrap();
+    let started = Utc::now();
+    voxtype_meeting_service::storage::persist_recorded_chunk(
+        &db,
+        PersistChunk {
+            session_id: &session_id,
+            run_id: &run.id,
+            provider: voxtype_meeting_service::config::ProviderKind::Voxtype,
+            model: "m",
+            dir: &mic_dir,
+            source: AudioSource::Mic,
+            started_at: started,
+            ended_at: started + chrono::Duration::seconds(1),
+            samples: &[0; 1600],
+        },
+    )
+    .unwrap();
+    let job_id: String = db
+        .with_conn(|conn| {
+            Ok(conn.query_row("SELECT id FROM transcription_jobs", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    db.with_conn(|conn| {
+        conn.execute("UPDATE transcription_jobs SET state = 'processing'", [])?;
+        Ok(())
+    })
+    .unwrap();
+
+    // A worker that errored before scheduling its own retry leaves the job in
+    // `processing`, which used to block every later claim forever.
+    let changed = db
+        .with_conn(|conn| requeue_processing_job(conn, &job_id, "database is locked"))
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let claimed = db.with_conn_mut(|conn| claim_due_jobs(conn, 1)).unwrap();
+    assert_eq!(claimed, vec![job_id]);
 }
 
 #[test]

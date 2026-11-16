@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 
 use crate::audio::AudioSource;
@@ -29,7 +29,10 @@ pub fn record_transcription_success(
     job_id: &str,
     result: &TranscriptionResult,
 ) -> Result<bool> {
-    let tx = conn.transaction()?;
+    // Immediate: this transaction reads and then writes. A deferred
+    // transaction takes a read snapshot first and fails with SQLITE_BUSY
+    // instead of waiting when another connection commits in between.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let existing: Option<String> = tx
         .query_row(
             "SELECT id FROM transcript_events WHERE job_id = ?1",
@@ -272,8 +275,33 @@ pub fn mark_job_retry(
     Ok(())
 }
 
+/// Return a job that a worker abandoned in `processing` to the queue.
+///
+/// A row left in `processing` occupies a concurrency slot forever:
+/// `claim_due_jobs` subtracts processing jobs from the configured limit, so
+/// one abandoned job stops every later job from ever being claimed. Callers
+/// use the `state = 'processing'` guard to avoid resurrecting jobs that a
+/// provider-specific retry path already moved back to `pending`.
+pub fn requeue_processing_job(conn: &Connection, job_id: &str, error: &str) -> Result<usize> {
+    let changed = conn.execute(
+        "UPDATE transcription_jobs
+         SET state = 'pending',
+             started_at = NULL,
+             attempt_count = attempt_count + 1,
+             last_error = ?1,
+             next_retry_at = ?2
+         WHERE id = ?3
+           AND state = 'processing'",
+        params![error, now_rfc3339(), job_id],
+    )?;
+    Ok(changed)
+}
+
 pub fn claim_due_jobs(conn: &mut Connection, limit: u32) -> Result<Vec<String>> {
-    let tx = conn.transaction()?;
+    // Immediate: see record_transcription_success. Reading the processing
+    // count and then claiming rows in one transaction must not fail with
+    // SQLITE_BUSY because another writer committed during the read.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = now_rfc3339();
     let processing: i64 = tx.query_row(
         "SELECT COUNT(*) FROM transcription_jobs WHERE state = 'processing'",
