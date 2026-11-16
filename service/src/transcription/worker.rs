@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -63,7 +63,7 @@ pub async fn run_workers(
                 if shutdown.is_cancelled() {
                     return;
                 }
-                match process_job(db_path, paths, config, job_id.clone()).await {
+                match process_job(db_path.clone(), paths, config, job_id.clone()).await {
                     Ok(session_id) => {
                         emit(
                             &events,
@@ -72,6 +72,15 @@ pub async fn run_workers(
                     }
                     Err(error) => {
                         tracing::error!(job_id, error = %error, "transcription worker error");
+                        if let Err(requeue) =
+                            requeue_failed_job(&db_path, &job_id, &error.to_string())
+                        {
+                            tracing::error!(
+                                job_id,
+                                error = %requeue,
+                                "failed to requeue job after worker error"
+                            );
+                        }
                     }
                 }
             });
@@ -163,6 +172,26 @@ fn schedule_retry(db: &Db, job_id: &str, error: &str) -> Result<()> {
         );
         mark_job_retry(conn, job_id, error, delay)
     })
+}
+
+/// Requeue a job whose worker task failed before scheduling its own retry.
+///
+/// `process_job` already moves provider failures back to `pending`, but an
+/// error before that point (a transient database error, for example) would
+/// leave the row in `processing`. That permanently blocks the queue because
+/// `claim_due_jobs` subtracts processing jobs from the concurrency limit.
+fn requeue_failed_job(db_path: &Path, job_id: &str, error: &str) -> Result<()> {
+    let db = Db::open(db_path)?;
+    let changed = db.with_conn(|conn| {
+        crate::storage::events::requeue_processing_job(conn, job_id, error)
+    })?;
+    if changed > 0 {
+        tracing::warn!(
+            job_id,
+            "requeued job left in processing after worker error"
+        );
+    }
+    Ok(())
 }
 
 pub async fn process_job_with_provider(
